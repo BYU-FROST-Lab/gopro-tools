@@ -25,6 +25,7 @@ import re
 import struct
 import subprocess
 import sys
+import io
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -57,6 +58,23 @@ KNOWN_STREAMS = {
     "IORI": ("ImageOrient",   ["w", "x", "y", "z"]),
     "GPS5": ("GPS",           ["lat_deg", "lon_deg", "alt_m", "speed_ms", "accuracy_m"]),
     "GPS9": ("GPS9",          ["lat_deg", "lon_deg", "alt_m", "speed_2d", "speed_3d", "unk1", "unk2", "unk3", "unk4"]),
+    # Exposure telemetry — averaged into video_settings, no CSV written
+    "SHUT": ("Shutter",     ["shutter_s"]),
+    "ISOE": ("ISO",         ["iso"]),
+    "TMPC": ("Temperature", ["temp_c"]),
+}
+
+# KNOWN_STREAMS keys that produce metadata averages instead of CSV files
+METADATA_ONLY_STREAMS = {"SHUT", "ISOE", "TMPC"}
+
+# udta/GPMF PRJT (projection) fourcc → human lens-mode name
+_PRJT_LENS_MODES = {
+    "GPRO": "Wide",
+    "SPRO": "SuperView",
+    "LINR": "Linear",
+    "NHZN": "Linear+Horizon Lock",
+    "WFOV": "HyperView",
+    "NFOV": "Narrow",
 }
 
 # ── GPMF binary parsing ───────────────────────────────────────────────────────
@@ -300,6 +318,223 @@ def extract_gpmf_binary(mp4: Path) -> bytes | None:
     return result.stdout if result.returncode == 0 and result.stdout else None
 
 
+# ── Video settings extraction ─────────────────────────────────────────────────
+
+def _find_mp4_box(path: Path, target: str) -> bytes | None:
+    """Return payload bytes of the first top-level MP4 box matching target fourcc."""
+    try:
+        with open(path, "rb") as f:
+            while True:
+                hdr = f.read(8)
+                if len(hdr) < 8:
+                    return None
+                size = struct.unpack(">I", hdr[:4])[0]
+                fourcc = hdr[4:8].decode("ascii", errors="replace")
+                if size == 0:
+                    # Box extends to EOF
+                    return f.read() if fourcc == target else None
+                if size == 1:
+                    # 64-bit extended size follows the fourcc
+                    ext = f.read(8)
+                    if len(ext) < 8:
+                        return None
+                    size = struct.unpack(">Q", ext)[0]
+                    payload_skip = size - 16
+                else:
+                    payload_skip = size - 8
+                if payload_skip < 0:
+                    return None
+                if fourcc == target:
+                    return f.read(payload_skip)
+                f.seek(payload_skip, 1)
+    except Exception:
+        return None
+
+
+def _walk_boxes(data: bytes) -> dict:
+    """Return {fourcc: payload_bytes} for immediate children of a container box."""
+    buf = io.BytesIO(data)
+    boxes: dict = {}
+    while buf.tell() < len(data) - 8:
+        hdr = buf.read(8)
+        if len(hdr) < 8:
+            break
+        size = struct.unpack(">I", hdr[:4])[0]
+        fourcc = hdr[4:8].decode("ascii", errors="replace")
+        if size < 8:
+            break
+        boxes[fourcc] = buf.read(max(0, size - 8))
+    return boxes
+
+
+def _decode_klv_val(tb: int, sz: int, rp: int, payload: bytes):
+    """Decode a single GPMF KLV scalar/string. Returns None for unsupported types."""
+    if tb in (ord('c'), ord('U')):
+        return payload[:sz * rp].decode("ascii", errors="replace").rstrip("\x00")
+    if tb == ord('F'):
+        return payload[:4].decode("ascii", errors="replace").rstrip("\x00")
+    if tb == ord('L') and sz == 4:
+        vals = [struct.unpack(">I", payload[i*4:i*4+4])[0] for i in range(rp)]
+        return vals[0] if rp == 1 else vals
+    if tb == ord('l') and sz == 4:
+        vals = [struct.unpack(">i", payload[i*4:i*4+4])[0] for i in range(rp)]
+        return vals[0] if rp == 1 else vals
+    if tb == ord('s') and sz == 2:
+        vals = [struct.unpack(">h", payload[i*2:i*2+2])[0] for i in range(rp)]
+        return vals[0] if rp == 1 else vals
+    if tb == ord('S') and sz == 2:
+        vals = [struct.unpack(">H", payload[i*2:i*2+2])[0] for i in range(rp)]
+        return vals[0] if rp == 1 else vals
+    if tb == ord('f') and sz == 4:
+        vals = [struct.unpack(">f", payload[i*4:i*4+4])[0] for i in range(rp)]
+        return vals[0] if rp == 1 else vals
+    if tb == ord('J') and sz == 8:
+        return struct.unpack(">Q", payload[:8])[0]
+    if tb in (ord('B'), ord('b')) and sz == 1:
+        return payload[0] if rp == 1 else list(payload[:rp])
+    return None
+
+
+def _parse_udta_gpmf(raw: bytes) -> dict:
+    """
+    Parse the udta/GPMF settings blob embedded in the MP4 moov box.
+    Returns {'settings': {key: val, ...}, 'fov': {'name': str, key: val, ...}}.
+    """
+    gs: dict = {}
+    fov: dict = {}
+    for key, tb, sz, rp, payload in _parse_klvs(raw):
+        if key != "DEVC":
+            continue
+        dvnm = ""
+        dvid_str = ""
+        for dkey, dtb, dsz, drp, dpayload in _parse_klvs(payload):
+            if dkey == "DVNM":
+                dvnm = dpayload.decode("ascii", errors="replace").rstrip("\x00")
+            elif dkey == "DVID":
+                dvid_str = dpayload[:4].decode("ascii", errors="replace")
+
+        is_global = dvnm == "Global Settings"
+        is_fov = dvid_str == "FOVL" or "FOV" in dvnm
+        if not (is_global or is_fov):
+            continue
+
+        target = gs if is_global else fov
+        if is_fov:
+            fov["name"] = dvnm
+        for dkey, dtb, dsz, drp, dpayload in _parse_klvs(payload):
+            if dkey in ("DVNM", "DVID"):
+                continue
+            val = _decode_klv_val(dtb, dsz, drp, dpayload)
+            if val is not None:
+                target[dkey] = val
+    return {"settings": gs, "fov": fov}
+
+
+def collect_video_settings(mp4: Path) -> dict:
+    """
+    Extract camera and recording settings from one MP4 file.
+
+    Sources:
+    - ffprobe video stream: codec, resolution, frame rate, color space, bitrate
+    - ffprobe format: container-level firmware tag, total bitrate
+    - MP4 udta/GPMF Global Settings block: lens mode, HyperSmooth, ProTune
+      (color profile, sharpness, white balance, ISO limits, EV comp), firmware,
+      model name, serial number, orientation, bitrate mode
+    - MP4 udta/GPMF FOV block: human-readable FOV name, horizontal FOV degrees
+    """
+    result: dict = {}
+
+    # ffprobe: video stream + container tags
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_streams", "-show_format", "-of", "json", str(mp4)],
+            capture_output=True, text=True, timeout=15,
+        )
+        data = json.loads(out.stdout or "{}")
+        for stream in data.get("streams", []):
+            if stream.get("codec_type") != "video":
+                continue
+            fps_str = stream.get("r_frame_rate", "")
+            fps = None
+            if "/" in fps_str:
+                n, d = fps_str.split("/")
+                fps = round(int(n) / int(d), 4) if int(d) else None
+            result.update({
+                "codec":               stream.get("codec_name"),
+                "codec_profile":       stream.get("profile"),
+                "width":               stream.get("width"),
+                "height":              stream.get("height"),
+                "aspect_ratio":        stream.get("display_aspect_ratio"),
+                "frame_rate":          fps,
+                "frame_rate_rational": fps_str,
+                "video_bitrate_bps":   int(stream.get("bit_rate") or 0) or None,
+                "color_space":         stream.get("color_space"),
+                "color_transfer":      stream.get("color_transfer"),
+                "color_primaries":     stream.get("color_primaries"),
+                "color_range":         stream.get("color_range"),
+                "pix_fmt":             stream.get("pix_fmt"),
+                "timecode":            stream.get("tags", {}).get("timecode"),
+            })
+            break
+        fmt = data.get("format", {})
+        result["total_bitrate_bps"] = int(fmt.get("bit_rate") or 0) or None
+        result["firmware"] = fmt.get("tags", {}).get("firmware")
+    except Exception:
+        pass
+
+    # udta/GPMF settings block embedded in the MP4 container
+    try:
+        moov = _find_mp4_box(mp4, "moov")
+        if moov:
+            gpmf_raw = _walk_boxes(_walk_boxes(moov).get("udta", b"")).get("GPMF")
+            if gpmf_raw:
+                parsed = _parse_udta_gpmf(gpmf_raw)
+                gs = parsed["settings"]
+                fov = parsed["fov"]
+
+                # Firmware / device identity (GPMF value is more specific than format tag)
+                if gs.get("FMWR"):
+                    result["firmware"] = gs["FMWR"]
+                result["model"]         = gs.get("MINF")
+                result["serial_number"] = gs.get("CASN")
+                result["lens_info"]     = gs.get("LINF")
+
+                # Lens / projection type
+                prjt = gs.get("PRJT") or ""
+                result["lens_mode_code"] = prjt or None
+                result["lens_mode"]      = _PRJT_LENS_MODES.get(prjt, prjt or None)
+
+                # Electronic Image Stabilization / HyperSmooth
+                result["hypersmooth_enabled"] = (gs.get("EISE") == "Y")
+                result["hypersmooth_setting"] = gs.get("HSGT")   # OFF / ON / BOOST / AUTO_BOOST
+                result["hypersmooth_level"]   = gs.get("HCTL")   # Off / On / Boost (display)
+
+                # ProTune settings
+                result["protune"]         = (gs.get("PRTN") == "Y")
+                result["color_profile"]   = gs.get("PTCL")   # NATURAL / FLAT / GoPro / HLG
+                result["sharpness"]       = gs.get("PTSH")   # LOW / MED / HIGH
+                result["white_balance"]   = gs.get("PTWB")   # AUTO / 2300K / … / 6500K
+                result["iso_min"]         = gs.get("PIMN")
+                result["iso_max"]         = gs.get("PIMX")
+                result["iso_mode"]        = gs.get("PIMD")   # AUTO / MANUAL
+                result["ev_compensation"] = gs.get("PTEV")
+                result["exposure_type"]   = gs.get("EXPT")   # AUTO / MANUAL
+
+                # Camera state
+                result["orientation"]  = gs.get("OREN")   # U=up D=down L=left R=right
+                result["bitrate_mode"] = gs.get("BITR")   # STANDARD / HIGH
+
+                # FOV block (separate DEVC with ZFOV float and human name)
+                if fov:
+                    result["fov_name"] = fov.get("name")
+                    zfov = fov.get("ZFOV")
+                    result["fov_horizontal_deg"] = round(zfov, 2) if zfov is not None else None
+    except Exception:
+        pass
+
+    return result
+
+
 # ── Metadata ──────────────────────────────────────────────────────────────────
 
 def collect_file_meta(mp4: Path) -> dict:
@@ -535,6 +770,10 @@ def process_mission(mission: Path, dry_run: bool, force: bool, no_plots: bool,
         total_dur = sum(m["duration_s"] or 0 for m in chapter_metas)
         first_ct = chapter_metas[0].get("creation_time_epoch")
         first_ct_str = chapter_metas[0].get("creation_time_utc")
+        print(f"    reading video settings: {paths[0].name} ...", end=" ", flush=True)
+        vid_settings = collect_video_settings(paths[0])
+        print(f"{vid_settings.get('codec','?').upper()} {vid_settings.get('width')}x{vid_settings.get('height')} "
+              f"@ {vid_settings.get('frame_rate','?')} fps  lens={vid_settings.get('lens_mode','?')}")
         camera_meta[cam] = {
             "source_files": [str(p) for p in paths],
             "n_chapters": len(paths),
@@ -545,6 +784,7 @@ def process_mission(mission: Path, dry_run: bool, force: bool, no_plots: bool,
             "creation_time_epoch": first_ct,
             "has_gps": False,
             "streams": {},
+            "video_settings": vid_settings,
         }
 
         # Extract and concatenate GPMF from all chapters
@@ -583,6 +823,15 @@ def process_mission(mission: Path, dry_run: bool, force: bool, no_plots: bool,
             ts, rows = extract_timeseries(all_packets, stream_key)
             if not ts:
                 continue
+
+            # Exposure telemetry: average into video_settings, no CSV
+            if stream_key in METADATA_ONLY_STREAMS:
+                vals = [row[0] for row in rows if row]
+                if vals:
+                    stat_key = {"SHUT": "avg_shutter_s", "ISOE": "avg_iso", "TMPC": "avg_temp_c"}[stream_key]
+                    camera_meta[cam]["video_settings"][stat_key] = round(sum(vals) / len(vals), 4)
+                continue
+
             camera_meta[cam]["streams"][stream_key] = len(ts)
             stream_summaries[cam][stream_key] = len(ts)
             camera_stream_data[cam][stream_key] = (ts, rows)
