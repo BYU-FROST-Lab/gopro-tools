@@ -31,11 +31,15 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+
+import yaml
 
 from utils import MISSION_MARKER, ffprobe
 
 RAW_DIR = "raw"
+CROP_FILE = "crop.yaml"
 
 
 # ── time parsing ─────────────────────────────────────────────────────────────
@@ -188,6 +192,29 @@ def _window_for(start_ref: float, end_ref: float, offset: float,
     return s, max(0.0, e - s), warns
 
 
+def write_crop_record(mission: Path, ref: str, start_ref: float, end_ref: float,
+                      method: str, lrv: bool, records: list[dict]) -> None:
+    """Write crop.yaml documenting the crop applied to this mission."""
+    doc = {
+        "reference_camera": ref,
+        "window": {
+            "start_s": round(start_ref, 3),
+            "end_s": round(end_ref, 3),
+            "duration_s": round(end_ref - start_ref, 3),
+            "start_hms": fmt_time(start_ref),
+            "end_hms": fmt_time(end_ref),
+        },
+        "method": method,
+        "lrv": lrv,
+        "updated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "note": ("Originals are preserved in raw/. Re-run crop_missions.py with a new "
+                 "--start/--end to re-cut from those originals; this file is rewritten."),
+        "crops": records,
+    }
+    with open(mission / CROP_FILE, "w") as f:
+        yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
+
+
 def crop_mission(mission: Path, start_ref: float, end_ref: float,
                  lrv: bool, dry_run: bool, force: bool, reencode: bool) -> bool:
     meta = load_metadata(mission)
@@ -200,14 +227,29 @@ def crop_mission(mission: Path, start_ref: float, end_ref: float,
         return True
     cameras = sorted(offsets)
 
+    raw_dir = mission / RAW_DIR
+
+    # If this mission was already cropped, re-cut from the recorded originals
+    # in raw/ rather than the (already-cropped) files in the mission folder.
+    crop_path = mission / CROP_FILE
+    recrop = crop_path.exists()
+    prev_originals: dict[str, str] = {}   # output name -> original path (relative to mission)
+    if recrop:
+        try:
+            prev = yaml.safe_load(crop_path.read_text()) or {}
+            prev_originals = {c.get("output"): c.get("original")
+                              for c in prev.get("crops", [])}
+        except Exception:
+            prev_originals = {}
+
     print(f"  Reference camera: {ref}")
     print(f"  Window on reference: {fmt_time(start_ref)} – {fmt_time(end_ref)}  "
           f"({end_ref - start_ref:.2f}s)")
+    if recrop:
+        print(f"  {CROP_FILE} found — re-cropping from originals in raw/")
 
-    raw_dir = mission / RAW_DIR
-
-    # Build job list: (camera, kind, src, dst, start, dur, offset, off_src)
-    jobs: list[tuple] = []
+    # Build job list. Each job: dict with all info for cropping + recording.
+    jobs: list[dict] = []
     pre_flight_ok = True
 
     for cam in cameras:
@@ -222,11 +264,24 @@ def crop_mission(mission: Path, start_ref: float, end_ref: float,
         ):
             if kind == "LRV" and not lrv:
                 continue
-            src = finder(mission, cam)
-            if src is None:
-                if kind == "MP4":
-                    print(f"  {cam}: no main video found — skipping")
-                continue
+
+            # Resolve the source. If this output was cropped before, re-cut from
+            # the recorded original (in raw/). Otherwise it's a first crop for
+            # this file: take the original from the mission folder and move it.
+            if out_name in prev_originals:
+                src = mission / prev_originals[out_name]
+                needs_move = False
+                if not src.exists():
+                    print(f"  {cam} {kind}: recorded original {prev_originals[out_name]} "
+                          f"missing — skipping (won't re-crop the cropped {out_name})")
+                    continue
+            else:
+                src = finder(mission, cam)
+                needs_move = True
+                if src is None:
+                    if kind == "MP4":
+                        print(f"  {cam}: no source video found — skipping")
+                    continue
 
             _, src_dur = ffprobe(str(src))
             s, dur, warns = _window_for(start_ref, end_ref, offset, src_dur)
@@ -242,13 +297,17 @@ def crop_mission(mission: Path, start_ref: float, end_ref: float,
                 print(f"      (empty window — skipping)")
                 continue
 
-            # Pre-flight: pre-crop original must not collide in raw/
+            # A to-be-moved original must not collide with something in raw/.
             raw_dst = raw_dir / src.name
-            if raw_dst.exists() and not force:
+            if needs_move and raw_dst.exists() and not force:
                 print(f"      ! raw/{src.name} already exists — use --force")
                 pre_flight_ok = False
 
-            jobs.append((cam, kind, src, dst, s, dur, raw_dst))
+            jobs.append({
+                "cam": cam, "kind": kind, "src": src, "dst": dst,
+                "start": s, "dur": dur, "raw_dst": raw_dst, "needs_move": needs_move,
+                "offset": offset, "off_src": off_src, "out_name": out_name,
+            })
 
     if not jobs:
         print("  Nothing to crop.")
@@ -264,33 +323,58 @@ def crop_mission(mission: Path, start_ref: float, end_ref: float,
         print(f"\n  Regenerate the overlay aligned to the cropped clip:")
         print(f"    python overlay_stats.py {mission} --crop-offset {start_ref:g} --force")
 
+    method = "reencode" if reencode else "stream-copy"
+
     if dry_run:
+        moved = sum(1 for j in jobs if j["needs_move"])
         print(f"\n  [dry-run] would crop {len(jobs)} file(s), "
-              f"move {len(jobs)} original(s) to raw/")
+              f"move {moved} original(s) to raw/, write {CROP_FILE}")
         return True
 
-    # Execute: crop to a temp name, move original to raw/, rename temp into place.
     raw_dir.mkdir(exist_ok=True)
     if not (raw_dir / MISSION_MARKER).exists():
         open(raw_dir / MISSION_MARKER, "w").close()
 
     any_error = False
-    for cam, kind, src, dst, s, dur, raw_dst in jobs:
+    records: list[dict] = []
+    for job in jobs:
+        dst = job["dst"]
         tmp = dst.with_name(f"{dst.stem}.cropping{dst.suffix}")
-        print(f"  {cam} {kind}: cropping ...")
-        if not ffmpeg_crop(src, tmp, s, dur, dry_run=False, reencode=reencode):
+        print(f"  {job['cam']} {job['kind']}: cropping ...")
+        if not ffmpeg_crop(job["src"], tmp, job["start"], job["dur"],
+                           dry_run=False, reencode=reencode):
             any_error = True
             if tmp.exists():
                 tmp.unlink()
             continue
-        # Move pre-crop original into raw/, then put cropped file in its place.
-        shutil.move(str(src), str(raw_dst))
+
+        if job["needs_move"]:
+            # Move pre-crop original into raw/, then put cropped file in place.
+            shutil.move(str(job["src"]), str(job["raw_dst"]))
+            original = job["raw_dst"]
+            print(f"      original -> raw/{job['raw_dst'].name}")
+        else:
+            # Original already in raw/; just replace the cropped output.
+            original = job["src"]
         os.replace(tmp, dst)
-        print(f"      original -> raw/{raw_dst.name}")
+
+        records.append({
+            "camera": job["cam"],
+            "kind": job["kind"],
+            "output": job["out_name"],
+            "original": str(original.relative_to(mission)),
+            "offset_s": round(job["offset"], 6),
+            "offset_src": "ref" if job["cam"] == ref else job["off_src"],
+            "crop_start_s": round(job["start"], 3),
+            "crop_dur_s": round(job["dur"], 3),
+        })
 
     if any_error:
         print("  Some crops failed — see errors above.", file=sys.stderr)
         return False
+
+    write_crop_record(mission, ref, start_ref, end_ref, method, lrv, records)
+    print(f"  Wrote {CROP_FILE}")
     return True
 
 

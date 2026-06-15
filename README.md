@@ -249,6 +249,46 @@ For each camera:
 
 If the mission has an `overlays.yaml`, the script also prints the matching `overlay_stats.py --crop-offset` command to regenerate the stats overlay aligned to the cropped clip (see [Subclip alignment](#subclip-alignment)).
 
+### The crop record (`crop.yaml`) and re-cropping
+
+On execute, the script writes a `crop.yaml` into the mission folder recording exactly what was done — the reference camera, the window (on the reference timeline), the method, and per-camera details including where each original now lives in `raw/`:
+
+```yaml
+reference_camera: Front
+window:
+  start_s: 665.0
+  end_s: 1680.0
+  duration_s: 1015.0
+  start_hms: '11:05.000'
+  end_hms: '28:00.000'
+method: stream-copy
+lrv: true
+crops:
+  - camera: Front
+    output: Front.MP4
+    original: raw/Front.MP4
+    offset_s: 0.0
+    offset_src: ref
+    crop_start_s: 665.0
+    crop_dur_s: 1015.0
+  - camera: Left
+    output: Left.MP4
+    original: raw/GX010306_Left.MP4
+    offset_s: 6.581
+    offset_src: gyro
+    crop_start_s: 658.419
+    crop_dur_s: 1015.0
+  # ...
+```
+
+**To change the crop, just run it again with a new window.** When a `crop.yaml` exists, the script re-cuts from the pristine **originals in `raw/`** (not the already-cropped files), so you can adjust the window as many times as you like without quality loss or drift:
+
+```bash
+python3 crop_missions.py /path/to/Mission --start 700 --end 1500 --lrv --execute
+```
+
+The originals in `raw/` are never touched, and `crop.yaml` is rewritten with the new window. `metadata.json` is never modified — it keeps describing the originals.
+
 ### Crop accuracy: stream copy vs. re-encode
 
 By default the crop uses **stream copy** — fast and lossless, but each cut lands on the nearest keyframe at or before the requested start (sub-second imprecision, and it can differ slightly per camera).

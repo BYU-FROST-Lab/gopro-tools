@@ -250,9 +250,20 @@ crop_mission(...)                 → dry-run prints plan; execute crops + archi
 
 **Stream mapping (important):** crop uses `-map 0:v:0 -map 0:a?` — video + optional audio only. It deliberately does **not** copy the GoPro data streams. GoPro MP4s carry a `tmcd` timecode stream (codec shows as "unknown") and the raw GX files also carry a `gpmd` GPMF stream. Using `-map 0 -copy_unknown` makes the MP4 muxer fail with *"Could not find tag for codec none in stream #2"* because it can't remux the unknown-codec `tmcd` track. Dropping the data streams is the same thing `compact_missions.py` does by omitting `-map 0`. Telemetry is already extracted to `data/` CSVs, so cropped viewing clips don't need GPMF. (The output still gets a valid `tmcd` track that the muxer regenerates from metadata — that's fine, it's not a copy of the broken stream.)
 
-**Archival flow (execute):** Crops to `{name}.cropping` temp → `shutil.move` original into `raw/` → `os.replace` temp into final name. This ensures the original is preserved before the final name is taken. Pre-flight aborts the mission if a pre-crop original already exists in `raw/` (unless `--force`). Writes `.gopro_mission` into `raw/` if absent.
+**Archival flow (execute):** Crops to `{name}.cropping{ext}` temp (extension preserved so ffmpeg infers the format) → `shutil.move` original into `raw/` → `os.replace` temp into final name. This ensures the original is preserved before the final name is taken. Pre-flight aborts the mission if a to-be-moved original would collide in `raw/` (unless `--force`). Writes `.gopro_mission` into `raw/` if absent.
 
-**Re-running:** Because cropped output reuses `{camera}.MP4`, re-running crop on an already-cropped mission would crop the cropped file. The raw/ collision check is the guard — the original is already in raw/, so a second run trips the pre-flight unless `--force`.
+**Crop record / re-cropping (`crop.yaml`):** On execute, the script writes `{mission}/crop.yaml` recording the reference camera, window (`start_s`/`end_s`/`duration_s` + HMS), method, and per-output details: `output`, `original` (path in `raw/`), `offset_s`, `offset_src`, `crop_start_s`, `crop_dur_s`.
+
+This file is both a provenance record and the enabler of re-cropping:
+- **First crop** (no `crop.yaml`): each output's source is resolved in the mission folder via `find_main_video`/`find_lrv_video`, cropped, and the original moved to `raw/` (`needs_move=True`).
+- **Re-crop** (`crop.yaml` present): for each output already listed in `crop.yaml`, the source is the recorded `original` in `raw/` — so a new `--start`/`--end` always re-cuts from the pristine original, never from the previous crop. The original stays in `raw/` (`needs_move=False`); only the cropped output is overwritten. `crop.yaml` is rewritten with the new window.
+- **Mixed** (e.g. adding `--lrv` after an MP4-only crop): outputs not yet in `crop.yaml` fall back to the first-crop path (source from mission folder, move to `raw/`).
+
+Driving re-crop from `crop.yaml`'s recorded `original` paths — rather than re-running the finders on `raw/` — is deliberate: `raw/` also contains the chapter files left by `compact_missions.py` (`raw/GX010148_Front.MP4`), so a finder pointed at `raw/` would wrongly pick a chapter. The recorded path is unambiguous.
+
+**Metadata is never modified** — `metadata.json` keeps describing the originals (now in `raw/`), which stays correct since re-crop always cuts from those originals using the same offsets.
+
+**Note:** Missions cropped before `crop.yaml` support existed have no record; re-running treats them as a first crop and the `raw/` collision guard blocks it (the original is already in `raw/`). Backfill a `crop.yaml` by hand (map each `output` to its `original` in `raw/`) to re-enable re-cropping.
 
 ## overlay_stats.py architecture
 
