@@ -199,6 +199,304 @@ python3 compact_missions.py <root> [options]
   --force         Overwrite existing output files
 ```
 
+---
+
+# Synchronized Multi-Camera Crop
+
+`crop_missions.py` crops every camera in a mission to a single time window that you specify on the **reference camera's** timeline. Each other camera is cropped to the same real-world moments using its measured clock offset, so the resulting clips stay in sync.
+
+You give times relative to the reference video (the one with offset 0.0 in `metadata.json`). The script applies each camera's offset automatically — preferring the gyro-derived offset (`gyro_offsets_s`, sub-frame accurate) and falling back to the creation-time offset (`sync_offsets_s`) when no gyro offset exists.
+
+Requires `data/metadata.json` with sync offsets — run `extract_telemetry.py` and `sync_gyro.py` first.
+
+### 1. Dry-run (default) to preview the plan
+
+```bash
+python3 crop_missions.py /path/to/Mission --start 200 --end 400
+```
+
+Times accept seconds (`200`), `MM:SS` (`3:20`), or `HH:MM:SS` (`1:03:20`). Example output:
+
+```
+[Plane]
+  Reference camera: Front
+  Window on reference: 3:20.000 – 6:40.000  (200.00s)
+  Front MP4: Front.MP4  offset=REF
+      crop 3:20.000 +200.00s -> Front.MP4
+  Left MP4: GX010306_Left.MP4  offset=+6.581s [gyro]
+      crop 3:13.419 +200.00s -> Left.MP4
+  Right MP4: GX010168_Right.MP4  offset=+4.675s [gyro]
+      crop 3:15.325 +200.00s -> Right.MP4
+```
+
+### 2. Include LRV proxies
+
+```bash
+python3 crop_missions.py /path/to/Mission --start 200 --end 400 --lrv
+```
+
+Also crops each camera's LRV proxy to `{camera}_LRV.MP4`.
+
+### 3. Execute
+
+```bash
+python3 crop_missions.py /path/to/Mission --start 200 --end 400 --lrv --execute
+```
+
+For each camera:
+- The cropped video is written as `{camera}.MP4` (and `{camera}_LRV.MP4`)
+- The pre-crop original is moved into `raw/`
+
+### Crop accuracy: stream copy vs. re-encode
+
+By default the crop uses **stream copy** — fast, lossless, and preserves the GPMF telemetry track, but each cut lands on the nearest keyframe at or before the requested start (sub-second imprecision, and it can differ slightly per camera).
+
+For frame-accurate cuts, add `--reencode` (re-encodes video with libx265, copies audio and telemetry):
+
+```bash
+python3 crop_missions.py /path/to/Mission --start 200 --end 400 --reencode --execute
+```
+
+This is much slower on full-res 5K footage. A common workflow is to crop the LRV proxies frame-accurately for review (`--lrv --reencode`) and stream-copy the full-res files.
+
+### All flags
+
+```
+python3 crop_missions.py MISSION --start T --end T [options]
+
+  --start T       window start on reference timeline (sec / MM:SS / HH:MM:SS)
+  --end T         window end on reference timeline
+  --lrv           also crop LRV proxy videos
+  --reencode      frame-accurate crop via re-encode (default: fast stream copy)
+  --execute       actually perform the crop (default: dry-run)
+  --force         overwrite if a pre-crop original already exists in raw/
+```
+
+`MISSION` may be a single mission folder or a parent folder containing several — missions without sync offsets are skipped.
+
+### Edge cases
+
+If the window starts before a camera began recording (or ends after it stopped), that camera's clip is clamped to its available footage and a warning is printed. The clamped clip aligns at the end (for a late start) or at the start (for an early end).
+
+---
+
+# GoPro Telemetry Extractor
+
+After compacting missions, run `extract_telemetry.py` to pull gyroscope, accelerometer, gravity, and orientation data out of the GPMF track embedded in each GoPro MP4 and write them to `{mission}/data/` as CSVs and plots.
+
+```bash
+python3 extract_telemetry.py /path/to/footage
+```
+
+Re-extract a mission that already has a `data/` folder:
+
+```bash
+python3 extract_telemetry.py /path/to/footage --force
+```
+
+Output written per mission:
+
+```
+{mission}/data/
+  metadata.json          ← sizes, durations, creation times, sync offsets
+  {camera}_gyro.csv      ← t_s, gx_rads, gy_rads, gz_rads
+  {camera}_accl.csv      ← t_s, ax_ms2, ay_ms2, az_ms2
+  {camera}_grav.csv      ← t_s, gx, gy, gz  (normalised gravity)
+  {camera}_cori.csv      ← t_s, w, x, y, z  (camera orientation quaternion)
+  {camera}_iori.csv      ← t_s, w, x, y, z  (image orientation quaternion)
+  plots/
+    all_cameras_accel_magnitude.png
+    {camera}_accl.png
+    {camera}_gyro.png
+    ...
+```
+
+---
+
+# Inter-Camera Sync (gyroscope cross-correlation)
+
+`sync_gyro.py` estimates how many seconds each camera's clock was ahead of or behind the reference camera, using the gyroscope magnitude `|ω| = √(gx²+gy²+gz²)`. Because all cameras are rigidly mounted, they share the same rotation — cross-correlating `|ω|` finds the clock offset without needing to know the physical rotation between cameras.
+
+Results are written into `{mission}/data/metadata.json` as `gyro_offsets_s`.
+
+```bash
+python3 sync_gyro.py /path/to/footage
+```
+
+Options:
+
+```
+  --max-lag S    Maximum offset to search in seconds (default: 30)
+  --dt S         Resampling interval in seconds (default: 0.005 = 200 Hz)
+  --plot         Show diagnostic cross-correlation plots (requires matplotlib)
+  --dry-run      Print results without writing to metadata.json
+  --force        Re-run even if gyro_offsets_s already present
+```
+
+---
+
+# ROS Bag IMU Extraction
+
+`extract_ros_imu.py` reads a `sensor_msgs/msg/Imu` topic from a ROS bag and writes gyro and accel CSVs in the same format as `extract_telemetry.py`. Placing the output in a mission's `data/` folder lets `sync_gyro.py` automatically cross-correlate the ROS IMU against the GoPro cameras to find the bag-to-camera time offset.
+
+Supports ROS1 (`.bag`) and ROS2 (`.db3` / `.mcap`) bag files. Requires the `rosbags` Python package.
+
+### Install
+
+```bash
+pip install rosbags
+```
+
+### Scan an entire footage directory (typical usage)
+
+Pass the root folder containing all mission subfolders. The script finds every ROS bag and writes CSVs into the corresponding mission's `data/` folder automatically:
+
+```bash
+python3 extract_ros_imu.py /path/to/footage/
+```
+
+Each mission is expected to contain exactly one ROS bag. Already-extracted missions are skipped:
+
+```
+Found 5 bag(s) under /path/to/footage
+  ball_3.0-...: reading /bluerov2/imu/data ...
+    216299 samples  1088.5 s  ~199 Hz
+    → .../Ball/data/bluerov2_gyro.csv
+    → .../Ball/data/bluerov2_accl.csv
+  plane_2.0-...: already extracted — skipping (use --force to overwrite)
+...
+Done — 4/5 bag(s) extracted.
+```
+
+### Single bag
+
+```bash
+python3 extract_ros_imu.py /path/to/MissionName/bag_directory/
+```
+
+Writes CSVs to `MissionName/data/` by default, or to a custom location with `--out`:
+
+```bash
+python3 extract_ros_imu.py /path/to/bag_directory/ --out /custom/output/dir/
+```
+
+### Custom topic
+
+```bash
+python3 extract_ros_imu.py /path/to/footage/ --topic /my_robot/imu/data
+```
+
+If the topic is not found in a bag, the script prints the available topics and continues to the next bag.
+
+### ROS2 multi-file bags
+
+ROS2 bags are often split into many `.mcap` segments inside a single directory (with a `metadata.yaml` alongside them). Pass the **directory**, not an individual file — this is the default layout and is handled automatically.
+
+---
+
+# Video Stats Overlay (ASS subtitles)
+
+`overlay_stats.py` generates an ASS subtitle file that overlays live ROS bag data on your GoPro video — no re-encoding needed. Works with any ROS topic and any message field. Load the `.ass` file alongside the video in VLC, mpv, or DaVinci Resolve.
+
+### Install
+
+```bash
+pip install pyyaml
+```
+
+### 1. Discover what topics are in your bag
+
+```bash
+python3 overlay_stats.py /path/to/MissionName --list-topics
+```
+
+### 2. Create a config file
+
+Create `overlays.yaml` in the mission folder:
+
+```yaml
+bag: bag_directory_name         # ROS2 bag dir (relative to mission) or absolute path
+bag_offset_s: 150.045           # seconds the bag started AFTER the GoPro reference camera
+camera: Front                   # which camera's video to target
+
+font_size: 40     # 40+ for 5K video; 16-20 for LRV proxy
+line_height: 50   # vertical spacing between stacked overlays
+
+overlays:
+  - topic: /bluerov2/imu/data
+    field: angular_velocity.x   # dot-notation into the message (supports array[0] indexing)
+    label: "Gyro X"
+    unit: "rad/s"
+    format: ".3f"
+    position: top-left          # top-left / top-right / bottom-left / bottom-right / top-center / bottom-center
+    color: "#00FF00"
+
+  - topic: /bluerov2/dvl/data
+    field: velocity.x
+    label: "DVL Vx"
+    unit: "m/s"
+    format: ".3f"
+    position: top-right
+    color: "#FF8800"
+```
+
+Multiple overlays at the same `position` stack vertically. `enabled: false` hides an overlay without deleting it.
+
+### 3. Generate the subtitle file
+
+```bash
+python3 overlay_stats.py /path/to/MissionName
+```
+
+Output: `MissionName/overlays/Front_stats.ass`
+
+### 4. View with mpv
+
+```bash
+mpv Front_LRV.MP4 --sub-file=overlays/Front_stats.ass
+```
+
+Or in VLC: **Subtitle → Add Subtitle File**. In DaVinci Resolve: import as a subtitle track.
+
+### Subclip alignment
+
+If you trim the video to a specific time range, generate a matching subtitle file with `--start` / `--end`. Timestamps in the output `.ass` are shifted to start at t=0, aligned with the trimmed clip:
+
+```bash
+python3 overlay_stats.py /path/to/MissionName --start 200 --end 600
+```
+
+### Other options
+
+```
+  --config PATH     alternate config file location
+  --camera NAME     override camera from config
+  --force           overwrite existing output
+  --dry-run         print plan without writing files
+```
+
+**Font size guidance:** The overlay uses `PlayResX/Y` set to the video's actual resolution. At 5K (5312×2988), use `font_size: 40`+. For LRV proxies (~540p), use `font_size: 16`–`20`.
+
+**N/A display:** Values show "N/A" when the video timestamp falls before the bag started or after it ended. The `bag_offset_s` in the config controls this boundary — get the value from `sync_gyro.py` output.
+
+---
+
+### Syncing the ROS IMU against GoPro cameras
+
+Once the CSV is in `data/`, run `sync_gyro.py` as normal. If the bag started more than 30 s into the GoPro recording, increase `--max-lag` accordingly:
+
+```bash
+python3 sync_gyro.py /path/to/MissionName --max-lag 200 --dry-run
+```
+
+The output includes the ROS IMU offset against the reference camera and pairwise consistency checks against every other camera.
+
+**Units:** Both the GoPro GPMF stream and `sensor_msgs/Imu` report gyro in **rad/s** and accel in **m/s²** — no conversion is needed.
+
+**Timestamp note:** The script uses `msg.header.stamp` (the sensor's own clock), not the bag record timestamp. The bag timestamp lags the header stamp by 4–25 ms due to OS scheduling jitter and is not suitable for precision synchronisation.
+
+---
+
 ## GPS and telemetry data
 
 GoPro cameras embed GPS, gyroscope, accelerometer, and temperature data as a **GPMF** (GoPro Metadata Format) binary track inside the MP4 container alongside the video and audio. This script uses **lossless stream copy** (`ffmpeg -c copy`), which preserves the GPMF track completely — GPS data is not lost during concatenation.

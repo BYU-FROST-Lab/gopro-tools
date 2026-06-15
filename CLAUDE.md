@@ -9,6 +9,10 @@ utils.py                ← shared constants, dataclasses, ffprobe helpers
 organize_missions.py    ← step 1: sort raw camera files into mission folders
 compact_missions.py     ← step 2: concatenate chapters, archive originals
 extract_telemetry.py    ← step 3: extract GPMF telemetry, generate plots & metadata
+sync_gyro.py            ← step 4: estimate inter-camera clock offsets via gyro cross-correlation
+extract_ros_imu.py      ← step 5: extract IMU data from a ROS2 bag into mission data/ folders
+overlay_stats.py        ← step 6: generate ASS subtitle overlay from any ROS bag topic/field
+crop_missions.py        ← step 7: crop all cameras to a synced time window, archive originals
 ```
 
 ## What each script does
@@ -20,6 +24,14 @@ extract_telemetry.py    ← step 3: extract GPMF telemetry, generate plots & met
 **`utils.py`** — Shared code imported by both scripts: `MISSION_MARKER`, `NAME_RE`, `VIDEO_EXTS`, `PROXY_EXTS`, `THUMB_EXTS`, `FileEntry`, `Recording`, `ffprobe()`, `thm_creation()`, `mtime()`, `best_start()`, `total_duration()`. Any future tool in this repo should import from here rather than re-implementing.
 
 **`extract_telemetry.py`** — Reads GPMF binary streams from raw chapter MP4 files (from `raw/` subfolders or main folder if not compacted), extracts telemetry data, and writes results into `{mission}/data/`. Does not modify any video files.
+
+**`sync_gyro.py`** — Estimates temporal offsets between cameras (and any other IMU source in `data/`) by cross-correlating gyroscope magnitude `|ω|`. Writes `gyro_offsets_s` into `metadata.json`. Any `*_gyro.csv` placed in `{mission}/data/` is automatically included — including `bluerov2_gyro.csv` produced by `extract_ros_imu.py`.
+
+**`crop_missions.py`** — Crops every camera in a mission to a time window given on the *reference* camera's timeline, keeping all cameras synchronized via their measured clock offsets. Cropped output is named `{camera}.MP4` (and `{camera}_LRV.MP4` with `--lrv`); the pre-crop original is moved into `raw/`. Dry-run by default. Imports `ffprobe` from `utils.py`.
+
+**`overlay_stats.py`** — Reads any topic/field from a ROS bag and generates an ASS subtitle file that overlays the values on a GoPro video. No re-encoding — load the `.ass` file alongside the video in VLC, mpv, or DaVinci Resolve. Requires `pyyaml` (`pip install pyyaml`).
+
+**`extract_ros_imu.py`** — Reads a ROS bag file (ROS1 `.bag` or ROS2 `.db3`/`.mcap`) and extracts `angular_velocity` and `linear_acceleration` from a `sensor_msgs/msg/Imu` topic. Writes `{name}_gyro.csv` and `{name}_accl.csv` in the same format as `extract_telemetry.py`, so `sync_gyro.py` can consume them directly. Requires the `rosbags` library (`pip install rosbags`).
 
 ## organize_missions.py architecture
 
@@ -205,6 +217,139 @@ GoPro MP4 files contain a third stream alongside video and audio: **GPMF** (GoPr
 - `.LRV` files are standard MP4 containers with a renamed extension. ffmpeg cannot auto-detect the output format from the `.LRV` extension — pass `-f mp4` explicitly, or output to a `.MP4` filename (current approach: `{camera}_LRV.MP4`).
 - **Do not install `gopro2gpx` or `gpmf-parser` as dependencies.** `extract_telemetry.py` contains a native GPMF binary parser that handles all streams (GPS5, ACCL, GYRO, GRAV, CORI, IORI) without external packages. `exiftool -GPS*` only returns the starting-point coordinates, not the full track.
 
+## crop_missions.py architecture
+
+```
+find_missions(root)
+  → [mission, ...]                ← root itself if marked, else marked subfolders
+
+load_metadata(mission)            → dict | None  (None = skip mission)
+resolve_offsets(meta)
+  → (ref_camera, {cam: (offset_s, "gyro"|"sync"|"missing")})
+                                    per camera: gyro_offsets_s preferred, sync_offsets_s fallback
+
+find_main_video(mission, cam)     → {cam}.MP4 or GX*_{cam}.MP4
+find_lrv_video(mission, cam)      → {cam}_LRV.MP4 / GL*_{cam}_LRV.MP4 / GL*_{cam}.LRV
+
+_window_for(start_ref, end_ref, offset, src_dur)
+  → (start, dur, warnings)        ← applies offset, clamps to footage bounds
+
+ffmpeg_crop(src, dst, start, dur, dry_run, reencode)
+  → bool                          ← -ss before -i; stream copy (+copy_unknown) or -c:v libx265
+
+crop_mission(...)                 → dry-run prints plan; execute crops + archives
+```
+
+**Offset/timing model:** `offset[C]` = seconds camera C started AFTER the reference (same convention as `sync_gyro.py`). For a window `[start_ref, end_ref]` on the reference timeline, camera C is cropped at `start_ref - offset[C]` for the same real-world moments. Negative offset (C started before ref) → C is cropped *later*. The reference camera is the one with offset 0.0.
+
+**Offset source priority (per the user's requirement):** `gyro_offsets_s` first (sub-frame accurate, from gyro cross-correlation), then `sync_offsets_s` (creation-time, second-resolution). A camera with neither is skipped.
+
+**Clamping:** If `start_C < 0` the clip is clamped to footage start (aligns at END, warns). If `end_C > camera_duration` it clamps to footage end (aligns at START, warns). Duration is recomputed after clamping.
+
+**Crop method:** Default is stream copy (`-c copy -copy_unknown`) — fast, preserves GPMF telemetry, but the cut lands on the nearest keyframe at/before the start (sub-second imprecision per camera). `--reencode` re-encodes video with libx265 for frame-accurate cuts while copying audio + data streams. `-ss` is placed before `-i` for fast input seeking in both modes.
+
+**Archival flow (execute):** Crops to `{name}.cropping` temp → `shutil.move` original into `raw/` → `os.replace` temp into final name. This ensures the original is preserved before the final name is taken. Pre-flight aborts the mission if a pre-crop original already exists in `raw/` (unless `--force`). Writes `.gopro_mission` into `raw/` if absent.
+
+**Re-running:** Because cropped output reuses `{camera}.MP4`, re-running crop on an already-cropped mission would crop the cropped file. The raw/ collision check is the guard — the original is already in raw/, so a second run trips the pre-flight unless `--force`.
+
+## overlay_stats.py architecture
+
+```
+load_config(config_path, mission_dir)
+  → validated cfg dict with "bag_path" resolved
+
+build_specs(cfg)
+  → list[OverlaySpec]           ← one per overlay entry in YAML
+
+resolve_positions(specs, W, H, line_height)
+  → mutates specs in-place      ← assigns x, y, an (ASS numpad alignment)
+
+load_bag_topics(bag_path, {topic: [field, ...]})
+  → {topic: {"t_s": ndarray, field: ndarray, ...}}
+    timestamps normalized to start at 0 (header.stamp preferred)
+
+generate_ass(out_path, specs, topic_data, fps, ...)
+  → writes .ass file            ← run-length encodes identical consecutive values
+```
+
+**Config file format** (`overlays.yaml` in each mission folder):
+
+```yaml
+bag: plane_2.0-2026-06-11-12-59-10   # relative to mission dir or absolute
+bag_offset_s: 150.045                 # seconds bag started AFTER GoPro t=0
+camera: Front                         # drives video probe for PlayRes
+font_size: 40                         # use 40+ for 5K video, 16-20 for LRV
+line_height: 50
+
+overlays:
+  - topic: /bluerov2/imu/data
+    field: angular_velocity.x         # dot-notation; supports field[0] array indexing
+    label: "Gyro X"
+    unit: "rad/s"
+    format: ".3f"
+    position: top-left                # or top-right/bottom-left/bottom-right/top-center/bottom-center
+    color: "#00FF00"
+    enabled: true                     # optional, default true
+```
+
+**Positions:** Named anchors (`top-left`, `top-right`, `bottom-left`, `bottom-right`, `top-center`, `bottom-center`) or `[x, y]` pixel list. Multiple overlays at the same anchor stack vertically. ASS `\an` numpad alignment is set automatically so right-anchored text right-justifies without needing to estimate text width.
+
+**ASS color format:** `&H00BBGGRR&` — R and B are swapped from HTML `#RRGGBB`. Alpha 0x00 = opaque (first byte). The script converts automatically via `_html_to_ass()`.
+
+**Timing:** `t_lookup = t_video - bag_offset_s`. If `t_lookup < 0` (bag hasn't started yet) or `> bag_duration`, the overlay shows "N/A". Uses `np.interp` for interpolation between bag samples.
+
+**Run-length encoding:** Consecutive frames with the same formatted value extend the previous Dialogue event rather than creating a new one. For slow-changing fields this drastically reduces file size (the Plane mission N/A period generates just 5 events instead of ~3600).
+
+**Subclip support (`--start` / `--end`):** All Dialogue timestamps are shifted by `-start_s` so the ASS file aligns with a video that has been trimmed to `[start_s, end_s]`.
+
+**PlayRes:** Probed from the actual video at runtime. Set `font_size` accordingly — 40pt at 5K (5312×2988) is visually equivalent to ~6pt at 540p (LRV). To target the LRV proxy, change `camera` to `Front_LRV` or similar and adjust `font_size`.
+
+## extract_ros_imu.py architecture
+
+```
+extract_imu(bag_path, topic, out_dir)
+  → writes {name}_gyro.csv and {name}_accl.csv
+
+Uses rosbags.highlevel.AnyReader — auto-detects format from path:
+  - ROS1 .bag file  → pass the .bag file path
+  - ROS2 multi-file bag (directory of .mcap + metadata.yaml) → pass the directory path
+```
+
+**ROS timestamp vs IMU header stamp — always use the header stamp:**
+
+The `rosbags` iterator yields `(connection, timestamp_ns, rawdata)`. The `timestamp_ns` is the **bag record time** — when the OS received and logged the message. On the Plane dataset this lagged the sensor by 4–25 ms with ~3.5 ms stdev (OS scheduling jitter). It is not suitable for precision sync.
+
+Always use `msg.header.stamp` instead:
+```python
+stamp = msg.header.stamp
+t_s = stamp.sec + stamp.nanosec * 1e-9
+```
+
+**Units — ROS matches GoPro, no conversion needed:**
+- `angular_velocity` (gyro): rad/s — same as GoPro GYRO stream
+- `linear_acceleration` (accel): m/s² — same as GoPro ACCL stream
+
+**Apparent Hz display artifact in sync_gyro.py:**
+
+`sync_gyro.py` reports Hz as `1 / median(diff(t))`. ROS IMU messages can be bursty (bursts with sub-millisecond gaps between messages in the same burst), making the median inter-sample gap smaller than the true period. The Plane bluerov2 shows ~349 Hz in the display but the actual average rate is 392 693 samples / 1964 s ≈ 200 Hz. The cross-correlation is unaffected because both signals are resampled to a uniform 5 ms grid before correlating.
+
+**One bag per mission — invariant:**
+
+Each mission folder contains exactly one ROS bag directory. `extract_ros_imu.py` discovers bags by scanning for `metadata.yaml` (ROS2) or `.bag` files (ROS1) and writes output into `{bag_parent}/data/`. This works correctly only when each mission has one bag; multiple bags per mission would overwrite each other's CSVs.
+
+**Integrating a ROS bag with sync_gyro.py:**
+
+1. Run `extract_ros_imu.py /path/to/root` to extract all missions at once — it writes CSVs directly into each mission's `data/` folder.
+2. `sync_gyro.py` globs `*_gyro.csv` in `data/` — no changes needed; the new source is included automatically.
+3. Set `--max-lag` large enough to cover the expected offset between the bag start and the GoPro reference camera start. On the Plane mission the bag started ~150 s after the GoPro Front camera, so `--max-lag 200` is the minimum safe value.
+4. Pairwise consistency between the ROS source and each GoPro camera is printed automatically when ≥3 sources are present.
+
+**Plane mission bag details (confirmed 2026-06-11):**
+- Bag: `plane_2.0-2026-06-11-12-59-10/` (ROS2 multi-file mcap, 17 segments)
+- IMU topic: `/bluerov2/imu/data` (`sensor_msgs/msg/Imu`, 200 Hz)
+- Bag start epoch: 1781204353.465 s (header stamp); GoPro Front start: 1781204211.0 s
+- Cross-correlation result: offset = +150 045 ms after Front, r = 0.8385
+
 ## Test data
 
 `/media/bjm255/Frostlab/SandHollow` — already organized by `organize_missions.py` and compacted by `compact_missions.py`. Missions: Ball, BlueBoat, Dam, DiveArea, FlatOpen, Plane, other.
@@ -212,3 +357,4 @@ GoPro MP4 files contain a third stream alongside video and audio: **GPMF** (GoPr
 - Ball and other already have `data/` folders from `extract_telemetry.py` runs — use `--force` to re-extract.
 - **other** and **Ball** are the best missions for quick testing (smallest files: other has clips under 32 MB; Ball has single-chapter GX files without the multi-chapter complexity of DiveArea/Dam).
 - All cameras are HERO11 Black with GPS disabled — no GPS5 stream will appear in any file from this dataset.
+- **Plane** has a ROS2 bag (`plane_2.0-2026-06-11-12-59-10/`) with a `/bluerov2/imu/data` topic. `bluerov2_gyro.csv` and `bluerov2_accl.csv` have already been extracted into `Plane/data/`. Use `--max-lag 200` when running `sync_gyro.py` on this mission.
