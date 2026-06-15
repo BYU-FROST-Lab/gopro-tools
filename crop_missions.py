@@ -140,14 +140,18 @@ def ffmpeg_crop(src: Path, dst: Path, start: float, dur: float,
     if dry_run:
         return True
 
+    # Map video + audio only. The GoPro timecode (tmcd) and GPMF (gpmd) data
+    # streams can't be remuxed into a fresh MP4 here and aren't needed in the
+    # cropped viewing clips (telemetry already lives in data/ CSVs).
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
-           "-ss", f"{start:.3f}", "-i", str(src), "-t", f"{dur:.3f}", "-map", "0"]
+           "-ss", f"{start:.3f}", "-i", str(src), "-t", f"{dur:.3f}",
+           "-map", "0:v:0", "-map", "0:a?"]
     if reencode:
-        # frame-accurate: re-encode video, copy audio + data (GPMF) streams
-        cmd += ["-c", "copy", "-c:v", "libx265", "-crf", "18", "-copy_unknown"]
+        # frame-accurate: re-encode video, copy audio
+        cmd += ["-c:v", "libx265", "-crf", "18", "-c:a", "copy"]
     else:
         # fast: stream copy; cut lands on nearest keyframe at/before start
-        cmd += ["-c", "copy", "-copy_unknown"]
+        cmd += ["-c", "copy"]
     cmd += ["-y", str(dst)]
 
     result = subprocess.run(cmd)
@@ -272,7 +276,7 @@ def crop_mission(mission: Path, start_ref: float, end_ref: float,
 
     any_error = False
     for cam, kind, src, dst, s, dur, raw_dst in jobs:
-        tmp = dst.with_suffix(dst.suffix + ".cropping")
+        tmp = dst.with_name(f"{dst.stem}.cropping{dst.suffix}")
         print(f"  {cam} {kind}: cropping ...")
         if not ffmpeg_crop(src, tmp, s, dur, dry_run=False, reencode=reencode):
             any_error = True

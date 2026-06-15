@@ -247,11 +247,15 @@ For each camera:
 - The cropped video is written as `{camera}.MP4` (and `{camera}_LRV.MP4`)
 - The pre-crop original is moved into `raw/`
 
+If the mission has an `overlays.yaml`, the script also prints the matching `overlay_stats.py --crop-offset` command to regenerate the stats overlay aligned to the cropped clip (see [Subclip alignment](#subclip-alignment)).
+
 ### Crop accuracy: stream copy vs. re-encode
 
-By default the crop uses **stream copy** — fast, lossless, and preserves the GPMF telemetry track, but each cut lands on the nearest keyframe at or before the requested start (sub-second imprecision, and it can differ slightly per camera).
+By default the crop uses **stream copy** — fast and lossless, but each cut lands on the nearest keyframe at or before the requested start (sub-second imprecision, and it can differ slightly per camera).
 
-For frame-accurate cuts, add `--reencode` (re-encodes video with libx265, copies audio and telemetry):
+Cropped clips contain video + audio only; the GoPro timecode and GPMF telemetry data streams are dropped (telemetry is already extracted to the `data/` CSVs).
+
+For frame-accurate cuts, add `--reencode` (re-encodes video with libx265, copies audio):
 
 ```bash
 python3 crop_missions.py /path/to/Mission --start 200 --end 400 --reencode --execute
@@ -460,11 +464,22 @@ Or in VLC: **Subtitle → Add Subtitle File**. In DaVinci Resolve: import as a s
 
 ### Subclip alignment
 
-If you trim the video to a specific time range, generate a matching subtitle file with `--start` / `--end`. Timestamps in the output `.ass` are shifted to start at t=0, aligned with the trimmed clip:
+There are two ways to align the overlay with a trimmed clip:
+
+**Before cropping** — generate against the full video with `--start` / `--end`. Output timestamps are shifted to start at t=0, matching a clip you'll trim to that range:
 
 ```bash
 python3 overlay_stats.py /path/to/MissionName --start 200 --end 600
 ```
+
+**After cropping with `crop_missions.py`** — use `--crop-offset` set to the crop's `--start`. This adjusts the bag alignment for a video that already begins partway into the original timeline (it subtracts the offset from `bag_offset_s`):
+
+```bash
+# you cropped with: crop_missions.py MissionName --start 200 --end 600 --execute
+python3 overlay_stats.py /path/to/MissionName --crop-offset 200 --force
+```
+
+`crop_missions.py` prints this exact command after a crop when an `overlays.yaml` is present.
 
 ### Other options
 

@@ -246,7 +246,9 @@ crop_mission(...)                 → dry-run prints plan; execute crops + archi
 
 **Clamping:** If `start_C < 0` the clip is clamped to footage start (aligns at END, warns). If `end_C > camera_duration` it clamps to footage end (aligns at START, warns). Duration is recomputed after clamping.
 
-**Crop method:** Default is stream copy (`-c copy -copy_unknown`) — fast, preserves GPMF telemetry, but the cut lands on the nearest keyframe at/before the start (sub-second imprecision per camera). `--reencode` re-encodes video with libx265 for frame-accurate cuts while copying audio + data streams. `-ss` is placed before `-i` for fast input seeking in both modes.
+**Crop method:** Default is stream copy (`-c copy`) — fast, but the cut lands on the nearest keyframe at/before the start (sub-second imprecision per camera). `--reencode` re-encodes video with libx265 for frame-accurate cuts while copying audio. `-ss` is placed before `-i` for fast input seeking in both modes.
+
+**Stream mapping (important):** crop uses `-map 0:v:0 -map 0:a?` — video + optional audio only. It deliberately does **not** copy the GoPro data streams. GoPro MP4s carry a `tmcd` timecode stream (codec shows as "unknown") and the raw GX files also carry a `gpmd` GPMF stream. Using `-map 0 -copy_unknown` makes the MP4 muxer fail with *"Could not find tag for codec none in stream #2"* because it can't remux the unknown-codec `tmcd` track. Dropping the data streams is the same thing `compact_missions.py` does by omitting `-map 0`. Telemetry is already extracted to `data/` CSVs, so cropped viewing clips don't need GPMF. (The output still gets a valid `tmcd` track that the muxer regenerates from metadata — that's fine, it's not a copy of the broken stream.)
 
 **Archival flow (execute):** Crops to `{name}.cropping` temp → `shutil.move` original into `raw/` → `os.replace` temp into final name. This ensures the original is preserved before the final name is taken. Pre-flight aborts the mission if a pre-crop original already exists in `raw/` (unless `--force`). Writes `.gopro_mission` into `raw/` if absent.
 
@@ -300,7 +302,9 @@ overlays:
 
 **Run-length encoding:** Consecutive frames with the same formatted value extend the previous Dialogue event rather than creating a new one. For slow-changing fields this drastically reduces file size (the Plane mission N/A period generates just 5 events instead of ~3600).
 
-**Subclip support (`--start` / `--end`):** All Dialogue timestamps are shifted by `-start_s` so the ASS file aligns with a video that has been trimmed to `[start_s, end_s]`.
+**Subclip support (`--start` / `--end`):** All Dialogue timestamps are shifted by `-start_s` so the ASS file aligns with a video that has been trimmed to `[start_s, end_s]`. Use this against the *full* video (before cropping) — it probes the full duration and clamps `--end` to it.
+
+**Cropped-video support (`--crop-offset T`):** For a video already cropped by `crop_missions.py`, the clip begins `T` seconds into the original reference timeline (where `T` = the crop's `--start`). The bag's `t=0` therefore sits at `bag_offset_s` on the original timeline, so the effective offset for the cropped clip is `bag_offset_s - T`. The flag simply subtracts `T` from `bag_offset_s`; no display shift is applied since the cropped file already starts at its own `t=0`. This is the correct way to overlay onto a cropped clip — `--start`/`--end` would mis-clamp because the probed duration is now the short clip. `crop_missions.py` prints the exact `--crop-offset` command to run after a crop.
 
 **PlayRes:** Probed from the actual video at runtime. Set `font_size` accordingly — 40pt at 5K (5312×2988) is visually equivalent to ~6pt at 540p (LRV). To target the LRV proxy, change `camera` to `Front_LRV` or similar and adjust `font_size`.
 
