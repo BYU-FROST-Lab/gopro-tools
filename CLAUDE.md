@@ -13,6 +13,7 @@ sync_gyro.py            ← step 4: estimate inter-camera clock offsets via gyro
 extract_ros_imu.py      ← step 5: extract IMU data from a ROS2 bag into mission data/ folders
 overlay_stats.py        ← step 6: generate ASS subtitle overlay from any ROS bag topic/field
 crop_missions.py        ← step 7: crop all cameras to a synced time window, archive originals
+run_pipeline.py         ← orchestrator: chains all steps over a root, pausing at 2 human checkpoints
 ```
 
 ## What each script does
@@ -21,7 +22,22 @@ crop_missions.py        ← step 7: crop all cameras to a synced time window, ar
 
 **`compact_missions.py`** — Scans a folder of already-organized mission subfolders (identified by `.gopro_mission` marker), concatenates chapter files per camera into single videos using lossless stream copy, and moves all originals to a `raw/` subfolder.
 
-**`utils.py`** — Shared code imported by both scripts: `MISSION_MARKER`, `NAME_RE`, `VIDEO_EXTS`, `PROXY_EXTS`, `THUMB_EXTS`, `FileEntry`, `Recording`, `ffprobe()`, `thm_creation()`, `mtime()`, `best_start()`, `total_duration()`. Any future tool in this repo should import from here rather than re-implementing.
+**`utils.py`** — Shared code imported across the toolchain. Constants/types: `MISSION_MARKER`, `NAME_RE`, `COMPACT_RE`, `SIMPLE_RE`, `VIDEO_EXTS`, `PROXY_EXTS`, `THUMB_EXTS`, `FileEntry`, `Recording`. Metadata helpers: `ffprobe()`, `thm_creation()`, `mtime()`, `best_start()`, `total_duration()`. Mission/IO helpers (added in the robustness pass): `find_missions(root, exit_on_empty=False)`, `is_mission()`, `mission_compacted()`, `load_metadata(mission, default=None)`, `save_metadata()` (atomic), `atomic_write_text()`, `atomic_write_bytes()`, `parse_time()`, `fmt_time()`. Any future tool should import from here rather than re-implementing — the discovery, metadata, and regex logic used to be copy-pasted (and subtly diverged) across five scripts.
+
+## Robustness conventions (crash / re-run safety)
+
+Two rules keep the pipeline safe to interrupt and re-run, and every script follows them:
+
+1. **Atomic writes.** No script writes a generated file directly to its final path. All text/JSON/CSV/`.ass`/`crop.yaml`/GPX outputs go through `utils.atomic_write_text` (write a sibling `.tmp`, then `os.replace`). ffmpeg outputs go to a sibling temp (`{stem}.concat.tmp{ext}` in compact, `{stem}.cropping{ext}` in crop) and are `os.replace`'d in only after a non-zero, non-empty result. So a killed process never leaves a truncated final file that would corrupt downstream steps.
+
+2. **Completion is signalled by the LAST artifact, written atomically.** Resume/skip checks (and `run_pipeline.py`'s `mission_state`) key off that artifact, never off an early-created one:
+   - compact → `raw/.gopro_mission` marker, written *after* all chapter moves (`utils.mission_compacted`). A `raw/` that exists *without* the marker means an interrupted run; compact refuses to silently skip it and asks for `--force`.
+   - telemetry → a valid `data/metadata.json` (`utils.load_metadata(...) is not None`), written last. A partial extraction (stray CSVs, no metadata) re-extracts cleanly.
+   - sync → `gyro_offsets_s` in metadata; crop → `crop.yaml`; ros → both gyro+accl CSVs (written back-to-back after all data is in memory, so you never get only one).
+
+   `utils.load_metadata` never raises — a corrupt/half-written `metadata.json` reads as the default, so callers treat the step as not-done rather than crashing.
+
+Known limitation: fully automatic mid-*compact* resume isn't attempted (originals may already be in `raw/`); the guarantees are "no corrupt output", "originals preserved in raw/", and "never silently mark an incomplete mission done".
 
 **`extract_telemetry.py`** — Reads GPMF binary streams from raw chapter MP4 files (from `raw/` subfolders or main folder if not compacted), extracts telemetry data, and writes results into `{mission}/data/`. Does not modify any video files.
 
@@ -32,6 +48,8 @@ crop_missions.py        ← step 7: crop all cameras to a synced time window, ar
 **`overlay_stats.py`** — Reads any topic/field from a ROS bag and generates an ASS subtitle file that overlays the values on a GoPro video. No re-encoding — load the `.ass` file alongside the video in VLC, mpv, or DaVinci Resolve. Requires `pyyaml` (`pip install pyyaml`).
 
 **`extract_ros_imu.py`** — Reads a ROS bag file (ROS1 `.bag` or ROS2 `.db3`/`.mcap`) and extracts `angular_velocity` and `linear_acceleration` from a `sensor_msgs/msg/Imu` topic. Writes `{name}_gyro.csv` and `{name}_accl.csv` in the same format as `extract_telemetry.py`, so `sync_gyro.py` can consume them directly. Requires the `rosbags` library (`pip install rosbags`).
+
+**`run_pipeline.py`** — Orchestrator that drives the whole toolchain over a root folder so you don't run the seven scripts by hand. Each step is invoked as a **subprocess** (using `sys.executable`), so heavy/optional deps (matplotlib, rosbags, numpy) stay isolated. It normalizes the scripts' inconsistent `--execute`-vs-`--dry-run` conventions behind a single `--execute` flag (orchestrator is **dry-run by default**), and pauses at the two real human checkpoints: (1) review/edit `mission_plan.csv` before organize moves files; (2) fill start/end per mission in `crop_plan.csv` before cropping. See the architecture section below.
 
 ## organize_missions.py architecture
 
@@ -365,6 +383,36 @@ Each mission folder contains exactly one ROS bag directory. `extract_ros_imu.py`
 - Bag start epoch: 1781204353.465 s (header stamp); GoPro Front start: 1781204211.0 s
 - Cross-correlation result: offset = +150 045 ms after Front, r = 0.8385
 
+## run_pipeline.py architecture
+
+```
+load_config(root, config_path, args)
+  → cfg dict        ← defaults < pipeline.yaml < CLI overrides (CLI > per-mission YAML > global)
+
+find_missions(root) / unorganized_camera_dirs(root) / find_bags(mission)
+  → discovery       ← find_bags is replicated inline so importing rosbags is NOT required
+
+mission_state(mission, cfg)
+  → dict[step,bool] ← per-mission done-detection, mirroring each child's own skip/force guards
+
+generate_crop_plan / read_crop_plan
+  → crop_plan.csv   ← checkpoint-2 file (uses crop_missions.load_metadata + resolve_offsets)
+
+drive(root, cfg, selected, execute, force)
+  → runs each selected step in order, pausing at the 2 checkpoints
+run(cmd, label)     → subprocess.run(sys.executable, script, ...) ; streams output, checks exit code
+```
+
+**Design choices:**
+- **Subprocess, not import.** Each step is run as `python <script>.py <root> <flags>`. The existing scripts already iterate a root via their own `find_missions`, print good plans, and validate their own args; subprocess keeps them canonical and isolates optional deps. The only things imported from siblings are read-only helpers: `utils.MISSION_MARKER`, `crop_missions.load_metadata`, `crop_missions.resolve_offsets`. `extract_ros_imu.find_bags` is **re-implemented inline** because that module imports `rosbags` at top level.
+- **Dry-run/execute normalization.** Orchestrator is dry-run by default. `--execute` translates per step because the children disagree: organize/compact/crop need `--execute`; telemetry/sync/overlay take `--dry-run`; ros always acts (skipped entirely in dry-run).
+- **Step granularity.** organize/compact/telemetry/ros run once at the **root** (children loop internally and self-skip done missions). sync/crop/overlay run **per-mission**: sync to honor per-mission `max_lag_s` overrides, crop because each mission has its own window, overlay because only missions with `overlays.yaml` apply.
+- **Two checkpoints halt the run.** `unorganized_camera_dirs(root)` non-empty → export `mission_plan.csv` and stop. After sync, no `crop_plan.csv` → generate it (pre-filled reference camera/duration/offset-source per mission) and stop. Re-running after each edit resumes. A `crop.yaml` already present means that mission is skipped on crop (re-crop needs `--force`).
+- **Selection:** `--steps a,b` / `--only x` / `--from x --to y` / `--skip a,b` against the fixed order `organize,compact,telemetry,ros,sync,crop,overlay`. `--status` prints a missions × steps matrix (`✓` done, `·` pending, `—` not applicable). `step_na` flags `—`: `ros` when the mission has no bag; `sync` when there are fewer than 2 gyro sources to cross-correlate (single-camera, no-bag mission), decided once `metadata.json` exists. `overlay` is never N/A — it stays `·` pending until a `{camera}_stats.ass` is generated, since you can always add an `overlays.yaml`.
+- **Config:** optional `pipeline.yaml` at root holds global + per-mission overrides (e.g. `missions.Plane.sync.max_lag_s: 200`); CLI flags (`--lrv`, `--reencode`, `--no-plots`, `--max-lag`, `--dt`, `--ros-topic`) override it.
+
+Generated artifacts at the root: `mission_plan.csv` (checkpoint 1), `crop_plan.csv` (checkpoint 2), optional `pipeline.yaml`.
+
 ## Test data
 
 `/media/bjm255/Frostlab/SandHollow` — already organized by `organize_missions.py` and compacted by `compact_missions.py`. Missions: Ball, BlueBoat, Dam, DiveArea, FlatOpen, Plane, other.
@@ -373,3 +421,4 @@ Each mission folder contains exactly one ROS bag directory. `extract_ros_imu.py`
 - **other** and **Ball** are the best missions for quick testing (smallest files: other has clips under 32 MB; Ball has single-chapter GX files without the multi-chapter complexity of DiveArea/Dam).
 - All cameras are HERO11 Black with GPS disabled — no GPS5 stream will appear in any file from this dataset.
 - **Plane** has a ROS2 bag (`plane_2.0-2026-06-11-12-59-10/`) with a `/bluerov2/imu/data` topic. `bluerov2_gyro.csv` and `bluerov2_accl.csv` have already been extracted into `Plane/data/`. Use `--max-lag 200` when running `sync_gyro.py` on this mission.
+- **Multiple missions carry ROS2 bags** (confirmed 2026-06-15): Ball, Dam, DiveArea, FlatOpen, and Plane each have a bag with `bluerov2_gyro.csv` already extracted into their `data/`. BlueBoat and other have no bag. `run_pipeline.py --status` shows `—` in the `ros` column for the bag-less missions.

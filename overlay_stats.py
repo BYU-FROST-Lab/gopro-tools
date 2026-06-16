@@ -26,6 +26,8 @@ import numpy as np
 import yaml
 from rosbags.highlevel import AnyReader
 
+from utils import load_metadata, atomic_write_text
+
 
 # ── data structures ────────────────────────────────────────────────────────────
 
@@ -371,10 +373,8 @@ def generate_ass(
     for i in range(len(specs)):
         flush(i, clip_end_s)
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(_ass_header(W, H, specs, font_size))
-        for ev in events:
-            f.write(ev + "\n")
+    text = _ass_header(W, H, specs, font_size) + "".join(ev + "\n" for ev in events)
+    atomic_write_text(out_path, text)
 
     print(f"  → {out_path}  ({len(events)} dialogue events)")
 
@@ -432,10 +432,8 @@ def main() -> None:
     # Resolve camera
     camera = args.camera or cfg.get("camera")
     if camera is None:
-        meta_path = mission_dir / "data" / "metadata.json"
-        if meta_path.exists():
-            with open(meta_path) as f:
-                meta = json.load(f)
+        meta = load_metadata(mission_dir)
+        if meta:
             offsets = meta.get("gyro_offsets_s", meta.get("sync_offsets_s", {}))
             camera = next((c for c, v in offsets.items() if v == 0.0), None)
             if camera is None and meta.get("cameras"):

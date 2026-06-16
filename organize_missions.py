@@ -447,7 +447,13 @@ def execute(plan):
 
     moved = 0
     for src, dst in plan:
-        shutil.move(src, dst)
+        try:
+            shutil.move(src, dst)
+        except OSError as e:
+            # Pre-flight already validated sources/destinations, so a failure here
+            # is a system error (permissions, disk, removed media). Abort loudly
+            # rather than continue and leave a half-reorganized tree.
+            sys.exit(f"\nABORT: move failed after {moved} file(s): {src} -> {dst}\n  {e}")
         moved += 1
     print(f"\nDone. Moved {moved} files.")
 

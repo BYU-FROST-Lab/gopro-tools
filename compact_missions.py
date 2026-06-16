@@ -25,40 +25,23 @@ Usage:
 
 import argparse
 import os
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from collections import defaultdict
 
-from utils import MISSION_MARKER, VIDEO_EXTS, PROXY_EXTS, THUMB_EXTS
-
-# Regex for files in an organized mission folder (output of organize_missions.py).
-# Format: GX010147_CameraName.MP4 / GL010147_CameraName.LRV
-COMPACT_RE = re.compile(
-    r"^(?P<prefix>G[XLH])(?P<chapter>\d{2})(?P<video>\d{4})_(?P<camera>[^.]+)\.(?P<ext>[A-Za-z0-9]+)$"
-)
+from utils import (MISSION_MARKER, VIDEO_EXTS, PROXY_EXTS, THUMB_EXTS,
+                   COMPACT_RE, find_missions, mission_compacted)
 
 RAW_DIR = "raw"
 
 
-def find_missions(root):
-    """Return sorted list of direct-child directories containing MISSION_MARKER.
-    If root itself contains MISSION_MARKER, returns [root]."""
-    if os.path.isfile(os.path.join(root, MISSION_MARKER)):
-        return [root]
+def _safe_unlink(path):
     try:
-        entries = sorted(os.listdir(root))
-    except OSError as e:
-        sys.exit(f"Cannot list directory: {root}: {e}")
-    return [
-        os.path.join(root, name)
-        for name in entries
-        if name != RAW_DIR
-        and os.path.isdir(os.path.join(root, name))
-        and os.path.isfile(os.path.join(root, name, MISSION_MARKER))
-    ]
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def parse_mission_files(folder):
@@ -95,20 +78,27 @@ def ffmpeg_concat(chapter_paths, output_path, dry_run, output_fmt=None):
         for p in chapter_paths:
             f.write(f"file '{p}'\n")
     try:
+        # Concat to a sibling temp, validate, then os.replace into place — so a
+        # killed/failed ffmpeg never leaves a truncated {camera}.MP4 behind.
+        stem, ext = os.path.splitext(output_path)
+        tmp_out = f"{stem}.concat.tmp{ext}"
         # -copy_unknown: copy streams ffmpeg can't identify (e.g. GoPro GPMF telemetry/GPS)
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
                "-f", "concat", "-safe", "0", "-i", list_file,
                "-c", "copy", "-copy_unknown"]
         if output_fmt:
             cmd += ["-f", output_fmt]
-        cmd += ["-y", output_path]
+        cmd += ["-y", tmp_out]
         result = subprocess.run(cmd)
         if result.returncode != 0:
             print(f"    ERROR: ffmpeg failed (exit {result.returncode})", file=sys.stderr)
+            _safe_unlink(tmp_out)
             return False
-        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        if not os.path.exists(tmp_out) or os.path.getsize(tmp_out) == 0:
             print(f"    ERROR: output missing or empty: {output_path}", file=sys.stderr)
+            _safe_unlink(tmp_out)
             return False
+        os.replace(tmp_out, output_path)
         size_mb = os.path.getsize(output_path) / 1_000_000
         print(f"    -> {os.path.basename(output_path)}  ({size_mb:.0f} MB)")
         return True
@@ -123,9 +113,16 @@ def compact_mission(folder, lrv, dry_run, force):
     """Process one mission folder. Returns True on success or skip, False on error."""
     raw_dir = os.path.join(folder, RAW_DIR)
 
-    if os.path.exists(raw_dir):
-        print(f"  Already compacted (raw/ exists) — skipping.")
+    # Completion is signalled by the marker written into raw/ as the LAST step.
+    if mission_compacted(folder):
+        print(f"  Already compacted (raw/ marker present) — skipping.")
         return True
+    if os.path.exists(raw_dir) and not force:
+        # raw/ exists but no completion marker: a prior run was interrupted.
+        # Don't silently skip — surface it rather than treat partial as done.
+        print(f"  raw/ exists without completion marker — looks partially compacted.\n"
+              f"  Inspect {raw_dir} and re-run with --force to finish.", file=sys.stderr)
+        return False
 
     files = parse_mission_files(folder)
     if not files:
@@ -227,9 +224,12 @@ def compact_mission(folder, lrv, dry_run, force):
         print(f"  [dry-run] write {MISSION_MARKER} to raw/")
     else:
         os.makedirs(raw_dir, exist_ok=True)
-        open(os.path.join(raw_dir, MISSION_MARKER), "w").close()
         for src in to_raw:
-            shutil.move(src, os.path.join(raw_dir, os.path.basename(src)))
+            dst = os.path.join(raw_dir, os.path.basename(src))
+            if os.path.exists(src):          # idempotent: a re-run may have already moved some
+                shutil.move(src, dst)
+        # Marker written LAST: its presence means the whole compact finished.
+        open(os.path.join(raw_dir, MISSION_MARKER), "w").close()
         print(f"  Moved {len(to_raw)} file(s) to raw/")
 
     return True

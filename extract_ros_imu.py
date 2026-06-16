@@ -24,10 +24,13 @@ Usage:
 
 import argparse
 import csv
+import io
 import sys
 from pathlib import Path
 
 from rosbags.highlevel import AnyReader
+
+from utils import atomic_write_text
 
 
 TOPIC_DEFAULT = "/bluerov2/imu/data"
@@ -72,7 +75,7 @@ def extract_imu(bag_path: Path, topic: str, out_dir: Path, force: bool) -> bool:
 
     if not force and gyro_path.exists() and accl_path.exists():
         print(f"  {bag_path.name}: already extracted — skipping (use --force to overwrite)")
-        return False
+        return True   # already done is success, not failure
 
     gyro_rows: list[tuple[float, float, float, float]] = []
     accl_rows: list[tuple[float, float, float, float]] = []
@@ -110,15 +113,17 @@ def extract_imu(bag_path: Path, topic: str, out_dir: Path, force: bool) -> bool:
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(gyro_path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["t_s", "gx_rads", "gy_rads", "gz_rads"])
-        w.writerows(gyro_rows)
+    # Both datasets are fully in memory; render then write atomically so a crash
+    # never leaves only one of the pair (the skip check requires both).
+    def _csv_text(header, rows):
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(header)
+        w.writerows(rows)
+        return buf.getvalue()
 
-    with open(accl_path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["t_s", "ax_ms2", "ay_ms2", "az_ms2"])
-        w.writerows(accl_rows)
+    atomic_write_text(gyro_path, _csv_text(["t_s", "gx_rads", "gy_rads", "gz_rads"], gyro_rows))
+    atomic_write_text(accl_path, _csv_text(["t_s", "ax_ms2", "ay_ms2", "az_ms2"], accl_rows))
 
     dur = gyro_rows[-1][0]
     hz = len(gyro_rows) / dur if dur > 0 else 0

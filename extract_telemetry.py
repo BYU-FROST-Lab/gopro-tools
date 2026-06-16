@@ -21,7 +21,6 @@ import argparse
 import csv
 import json
 import os
-import re
 import struct
 import subprocess
 import sys
@@ -40,14 +39,8 @@ except ImportError:
     HAS_MPL = False
     print("Warning: matplotlib/numpy not installed — plots will be skipped.", file=sys.stderr)
 
-from utils import MISSION_MARKER, ffprobe
-
-# Post-organization filename: GX010149_Front.MP4
-COMPACT_RE = re.compile(
-    r"^(?P<prefix>G[XLH])(?P<chapter>\d{2})(?P<video>\d{4})_(?P<camera>[^.]+)\.(?P<ext>[A-Za-z0-9]+)$"
-)
-# Compacted filename: Front.MP4
-SIMPLE_RE = re.compile(r"^(?P<camera>[A-Za-z][A-Za-z0-9_]*)\.(?P<ext>MP4|LRV)$", re.IGNORECASE)
+from utils import (MISSION_MARKER, ffprobe, find_missions, load_metadata,
+                   save_metadata, atomic_write_text, COMPACT_RE, SIMPLE_RE)
 
 # Streams to extract: key → (human name, columns)
 KNOWN_STREAMS = {
@@ -188,6 +181,9 @@ def extract_timeseries(packets: list, stream_key: str) -> tuple:
     timestamps = []
     scaled_rows = []
 
+    n_nonmono = 0      # blocks where STMP didn't advance (timing fell back to 200 Hz)
+    n_unscaled = 0     # rows emitted without a usable SCAL factor
+
     prev_stmp_us = 0
     for b in blocks:
         stmp_us = b["stmp_us"]
@@ -202,6 +198,7 @@ def extract_timeseries(packets: list, stream_key: str) -> tuple:
         dt = (stmp_us - prev_stmp_us) / 1e6  # seconds this block covers
         if dt <= 0:
             dt = n / 200.0  # fallback: assume 200 Hz
+            n_nonmono += 1
         t_start = prev_stmp_us / 1e6
         for i, row in enumerate(b["rows"]):
             t = t_start + (i + 0.5) * dt / n
@@ -213,21 +210,21 @@ def extract_timeseries(packets: list, stream_key: str) -> tuple:
                                     for j, v in enumerate(row)])
             else:
                 scaled_rows.append(list(row))
+                n_unscaled += 1
         prev_stmp_us = stmp_us
+
+    # Non-fatal: surface silent degradation rather than hide it (timing math unchanged).
+    if n_nonmono:
+        print(f"    ! {stream_key}: {n_nonmono} block(s) with non-monotonic STMP "
+              f"— timing fell back to 200 Hz", file=sys.stderr)
+    if n_unscaled:
+        print(f"    ! {stream_key}: {n_unscaled} row(s) emitted without a SCAL factor "
+              f"(values left unscaled)", file=sys.stderr)
 
     return timestamps, scaled_rows
 
 
 # ── File discovery ────────────────────────────────────────────────────────────
-
-def find_missions(root: Path) -> list:
-    """Return list of mission folder Paths (those containing MISSION_MARKER)."""
-    missions = []
-    for entry in sorted(root.iterdir()):
-        if entry.is_dir() and (entry / MISSION_MARKER).exists():
-            missions.append(entry)
-    return missions
-
 
 def find_gpmf_sources(mission: Path) -> dict:
     """
@@ -558,10 +555,11 @@ def collect_file_meta(mp4: Path) -> dict:
 
 def write_csv(path: Path, header: list, rows: list) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(header)
-        w.writerows(rows)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(header)
+    w.writerows(rows)
+    atomic_write_text(path, buf.getvalue())
 
 
 def write_gpx(path: Path, gps_rows: list, timestamps: list, camera: str) -> None:
@@ -581,7 +579,7 @@ def write_gpx(path: Path, gps_rows: list, timestamps: list, camera: str) -> None
         ts_str = datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         lines.append(f'    <trkpt lat="{lat:.7f}" lon="{lon:.7f}"><ele>{alt:.2f}</ele><time>{ts_str}</time></trkpt>')
     lines += ["  </trkseg></trk>", "</gpx>"]
-    path.write_text("\n".join(lines))
+    atomic_write_text(path, "\n".join(lines))
 
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
@@ -738,11 +736,12 @@ def process_mission(mission: Path, dry_run: bool, force: bool, no_plots: bool,
     data_dir = mission / "data"
     plots_dir = data_dir / "plots"
 
-    if data_dir.exists() and not force:
-        existing = list(data_dir.glob("*.csv"))
-        if existing:
-            print(f"  data/ already has {len(existing)} CSV(s). Use --force to re-extract.")
-            return
+    # metadata.json is written LAST and atomically, so its presence (not stray
+    # CSVs from a partial run) is the completion signal. A half-finished extraction
+    # has no valid metadata, so it re-extracts cleanly.
+    if not force and load_metadata(mission) is not None:
+        print(f"  data/metadata.json present. Use --force to re-extract.")
+        return
 
     print(f"  Cameras: {', '.join(sorted(sources))}")
 
@@ -797,6 +796,9 @@ def process_mission(mission: Path, dry_run: bool, force: bool, no_plots: bool,
                 print("no GPMF stream")
                 continue
             pkts = parse_gpmf_packets(raw)
+            if not pkts:
+                print(f"\n    ! {p.name}: GPMF stream present but no packets parsed",
+                      file=sys.stderr)
             # Offset chapter timestamps so they are continuous
             if chapter_offset_us > 0:
                 for pkt in pkts:
@@ -877,10 +879,8 @@ def process_mission(mission: Path, dry_run: bool, force: bool, no_plots: bool,
         "cameras": camera_meta,
         "sync_offsets_s": sync_offsets,
     }
-    meta_path = data_dir / "metadata.json"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    meta_path.write_text(json.dumps(meta, indent=2))
-    print(f"\n  Metadata → {meta_path}")
+    save_metadata(mission, meta)
+    print(f"\n  Metadata → {data_dir / 'metadata.json'}")
 
     # ── Plots ──────────────────────────────────────────────────────────────
     if not HAS_MPL or no_plots:

@@ -7,13 +7,22 @@ import json
 import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 
 MISSION_MARKER = ".gopro_mission"
 
 # GoPro filename: prefix(GX/GL/GH) + 2-digit chapter + 4-digit video number + ext
 NAME_RE = re.compile(r"^(?P<prefix>G[XLH])(?P<chapter>\d{2})(?P<video>\d{4})\.(?P<ext>[A-Za-z0-9]+)$")
+
+# Organized filename (post-organize): same, with a _{camera} suffix before the ext.
+COMPACT_RE = re.compile(
+    r"^(?P<prefix>G[XLH])(?P<chapter>\d{2})(?P<video>\d{4})_(?P<camera>[^.]+)\.(?P<ext>[A-Za-z0-9]+)$")
+
+# Compacted filename (post-compact): just {camera}.MP4 / {camera}.LRV, no chapter/video#.
+SIMPLE_RE = re.compile(r"^(?P<camera>[A-Za-z][A-Za-z0-9_]*)\.(?P<ext>MP4|LRV)$", re.IGNORECASE)
 
 VIDEO_EXTS = {"MP4"}
 PROXY_EXTS = {"LRV"}
@@ -168,3 +177,108 @@ def total_duration(rec):
     if len(mts) >= 2:
         return max(mts) - min(mts), "mtime-span(approx)"
     return None, "none"
+
+
+# ---------------------------------------------------------------------------
+# Atomic writes — every generated file is written to a sibling .tmp then
+# os.replace()'d into place, so a crash never leaves a truncated final file.
+# ---------------------------------------------------------------------------
+
+def atomic_write_text(path, text: str, encoding: str = "utf-8") -> None:
+    """Atomically write text to path (write sibling .tmp, then os.replace)."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding=encoding)
+    os.replace(tmp, path)
+
+
+def atomic_write_bytes(path, data: bytes) -> None:
+    """Atomically write bytes to path (write sibling .tmp, then os.replace)."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
+# Mission discovery and metadata.json I/O — shared by all pipeline scripts.
+# ---------------------------------------------------------------------------
+
+def is_mission(path) -> bool:
+    """A folder is a mission if it carries the marker or already has metadata.json."""
+    path = Path(path)
+    return (path / MISSION_MARKER).exists() or (path / "data" / "metadata.json").exists()
+
+
+def find_missions(root, exit_on_empty: bool = False) -> list:
+    """Return mission folders under root.
+
+    If root itself is a mission, return [root]; otherwise return immediate
+    subfolders carrying the .gopro_mission marker. With exit_on_empty=True,
+    sys.exit with a message when none are found (CLI convenience).
+    """
+    root = Path(root)
+    if is_mission(root):
+        return [root]
+    missions = sorted(p.parent for p in root.glob(f"*/{MISSION_MARKER}"))
+    if not missions and exit_on_empty:
+        sys.exit(
+            f"error: no missions found under {root}\n"
+            f"  (no {MISSION_MARKER} markers in immediate subfolders)"
+        )
+    return missions
+
+
+def mission_compacted(mission) -> bool:
+    """Compact completion sentinel: raw/ exists AND carries the marker (written last)."""
+    return (Path(mission) / "raw" / MISSION_MARKER).exists()
+
+
+def load_metadata(mission, default=None):
+    """Load mission/data/metadata.json. Return default on missing or unreadable.
+
+    Never raises — a corrupt/half-written metadata.json reads as default so callers
+    treat the step as not-yet-done rather than crashing.
+    """
+    path = Path(mission) / "data" / "metadata.json"
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return default
+
+
+def save_metadata(mission, meta: dict) -> None:
+    """Atomically write mission/data/metadata.json (creates data/ if needed)."""
+    data_dir = Path(mission) / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(data_dir / "metadata.json", json.dumps(meta, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Time parsing/formatting (reference-timeline windows, crop records).
+# ---------------------------------------------------------------------------
+
+def parse_time(s: str) -> float:
+    """Parse seconds ('123.5'), MM:SS ('3:20'), or HH:MM:SS ('1:03:20') -> seconds."""
+    s = s.strip()
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) > 3:
+            raise ValueError(f"invalid time: {s}")
+        sec = 0.0
+        for p in parts:
+            sec = sec * 60 + float(p)
+        return sec
+    return float(s)
+
+
+def fmt_time(t: float) -> str:
+    """Format seconds as M:SS.mmm or H:MM:SS.mmm."""
+    h = int(t // 3600)
+    m = int((t % 3600) // 60)
+    s = t % 60
+    if h:
+        return f"{h}:{m:02d}:{s:06.3f}"
+    return f"{m}:{s:06.3f}"

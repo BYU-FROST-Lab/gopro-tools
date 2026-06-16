@@ -26,7 +26,6 @@ Usage:
 """
 
 import argparse
-import json
 import os
 import shutil
 import subprocess
@@ -36,60 +35,15 @@ from pathlib import Path
 
 import yaml
 
-from utils import MISSION_MARKER, ffprobe
+from utils import (MISSION_MARKER, ffprobe, find_missions, load_metadata,
+                   parse_time, fmt_time, atomic_write_text)
 
 RAW_DIR = "raw"
 CROP_FILE = "crop.yaml"
 
 
-# ── time parsing ─────────────────────────────────────────────────────────────
-
-def parse_time(s: str) -> float:
-    """Parse seconds ('123.5'), MM:SS ('3:20'), or HH:MM:SS ('1:03:20') → float seconds."""
-    s = s.strip()
-    if ":" in s:
-        parts = s.split(":")
-        if len(parts) > 3:
-            raise ValueError(f"invalid time: {s}")
-        parts = [float(p) for p in parts]
-        sec = 0.0
-        for p in parts:
-            sec = sec * 60 + p
-        return sec
-    return float(s)
-
-
-def fmt_time(t: float) -> str:
-    h = int(t // 3600)
-    m = int((t % 3600) // 60)
-    s = t % 60
-    if h:
-        return f"{h}:{m:02d}:{s:06.3f}"
-    return f"{m}:{s:06.3f}"
-
-
-# ── mission discovery ────────────────────────────────────────────────────────
-
-def find_missions(root: Path) -> list[Path]:
-    if (root / MISSION_MARKER).exists() or (root / "data" / "metadata.json").exists():
-        return [root]
-    missions = sorted(p.parent for p in root.glob(f"*/{MISSION_MARKER}"))
-    if not missions:
-        sys.exit(
-            f"error: no missions found under {root}\n"
-            f"  (no {MISSION_MARKER} markers in immediate subfolders)"
-        )
-    return missions
-
-
 # ── metadata / offsets ───────────────────────────────────────────────────────
-
-def load_metadata(mission: Path) -> dict | None:
-    path = mission / "data" / "metadata.json"
-    if not path.exists():
-        return None
-    with open(path) as f:
-        return json.load(f)
+# parse_time, fmt_time, find_missions, load_metadata are imported from utils.
 
 
 def resolve_offsets(meta: dict) -> tuple[str, dict[str, tuple[float, str]]]:
@@ -211,8 +165,8 @@ def write_crop_record(mission: Path, ref: str, start_ref: float, end_ref: float,
                  "--start/--end to re-cut from those originals; this file is rewritten."),
         "crops": records,
     }
-    with open(mission / CROP_FILE, "w") as f:
-        yaml.safe_dump(doc, f, sort_keys=False, default_flow_style=False)
+    atomic_write_text(mission / CROP_FILE,
+                      yaml.safe_dump(doc, sort_keys=False, default_flow_style=False))
 
 
 def crop_mission(mission: Path, start_ref: float, end_ref: float,
@@ -337,37 +291,45 @@ def crop_mission(mission: Path, start_ref: float, end_ref: float,
 
     any_error = False
     records: list[dict] = []
-    for job in jobs:
-        dst = job["dst"]
-        tmp = dst.with_name(f"{dst.stem}.cropping{dst.suffix}")
-        print(f"  {job['cam']} {job['kind']}: cropping ...")
-        if not ffmpeg_crop(job["src"], tmp, job["start"], job["dur"],
-                           dry_run=False, reencode=reencode):
-            any_error = True
+    # Track temps so a Ctrl-C / exception never leaves a .cropping file behind.
+    tmps = [j["dst"].with_name(f"{j['dst'].stem}.cropping{j['dst'].suffix}") for j in jobs]
+    try:
+        for job in jobs:
+            dst = job["dst"]
+            tmp = dst.with_name(f"{dst.stem}.cropping{dst.suffix}")
+            print(f"  {job['cam']} {job['kind']}: cropping ...")
+            if not ffmpeg_crop(job["src"], tmp, job["start"], job["dur"],
+                               dry_run=False, reencode=reencode):
+                any_error = True
+                continue
+
+            if job["needs_move"]:
+                # Move pre-crop original into raw/, then put cropped file in place.
+                shutil.move(str(job["src"]), str(job["raw_dst"]))
+                original = job["raw_dst"]
+                print(f"      original -> raw/{job['raw_dst'].name}")
+            else:
+                # Original already in raw/; just replace the cropped output.
+                original = job["src"]
+            os.replace(tmp, dst)
+
+            records.append({
+                "camera": job["cam"],
+                "kind": job["kind"],
+                "output": job["out_name"],
+                "original": str(original.relative_to(mission)),
+                "offset_s": round(job["offset"], 6),
+                "offset_src": "ref" if job["cam"] == ref else job["off_src"],
+                "crop_start_s": round(job["start"], 3),
+                "crop_dur_s": round(job["dur"], 3),
+            })
+    finally:
+        for tmp in tmps:
             if tmp.exists():
-                tmp.unlink()
-            continue
-
-        if job["needs_move"]:
-            # Move pre-crop original into raw/, then put cropped file in place.
-            shutil.move(str(job["src"]), str(job["raw_dst"]))
-            original = job["raw_dst"]
-            print(f"      original -> raw/{job['raw_dst'].name}")
-        else:
-            # Original already in raw/; just replace the cropped output.
-            original = job["src"]
-        os.replace(tmp, dst)
-
-        records.append({
-            "camera": job["cam"],
-            "kind": job["kind"],
-            "output": job["out_name"],
-            "original": str(original.relative_to(mission)),
-            "offset_s": round(job["offset"], 6),
-            "offset_src": "ref" if job["cam"] == ref else job["off_src"],
-            "crop_start_s": round(job["start"], 3),
-            "crop_dur_s": round(job["dur"], 3),
-        })
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
 
     if any_error:
         print("  Some crops failed — see errors above.", file=sys.stderr)
@@ -401,13 +363,15 @@ def main() -> None:
                     help="overwrite if a pre-crop original already exists in raw/")
     args = ap.parse_args()
 
+    if args.start < 0 or args.end < 0:
+        sys.exit(f"error: --start/--end must be non-negative (got {args.start}, {args.end})")
     if args.end <= args.start:
         sys.exit(f"error: --end ({args.end}) must be greater than --start ({args.start})")
 
     if not args.mission.exists():
         sys.exit(f"error: not found: {args.mission}")
 
-    missions = find_missions(args.mission)
+    missions = find_missions(args.mission, exit_on_empty=True)
     dry_run = not args.execute
 
     print(f"Mode:  {'DRY RUN' if dry_run else 'EXECUTE'}"

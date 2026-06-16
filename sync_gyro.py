@@ -27,49 +27,15 @@ Usage:
 
 import argparse
 import csv
-import json
 import sys
 from pathlib import Path
 
 import numpy as np
 
-MISSION_MARKER = ".gopro_mission"
+from utils import MISSION_MARKER, find_missions, load_metadata, save_metadata
+
 MIN_DURATION_S = 5.0   # skip cameras with less than this much gyro data
 MIN_OVERLAP_S  = 3.0   # skip pairs with less than this much estimated overlap
-
-
-# ── mission discovery ─────────────────────────────────────────────────────────
-
-def find_missions(root: Path) -> list[Path]:
-    """
-    Return a list of mission folder paths.
-    If root itself is a mission (has .gopro_mission or data/metadata.json), return [root].
-    Otherwise scan immediate subfolders for .gopro_mission markers.
-    """
-    if (root / MISSION_MARKER).exists() or (root / "data" / "metadata.json").exists():
-        return [root]
-    missions = sorted(p.parent for p in root.glob(f"*/{MISSION_MARKER}"))
-    if not missions:
-        sys.exit(
-            f"error: no missions found under {root}\n"
-            f"  (no {MISSION_MARKER} markers in immediate subfolders)"
-        )
-    return missions
-
-
-# ── metadata.json I/O ─────────────────────────────────────────────────────────
-
-def load_metadata(mission: Path) -> dict:
-    path = mission / "data" / "metadata.json"
-    if not path.exists():
-        return {}
-    with open(path) as f:
-        return json.load(f)
-
-
-def save_metadata(mission: Path, meta: dict) -> None:
-    path = mission / "data" / "metadata.json"
-    path.write_text(json.dumps(meta, indent=2))
 
 
 def reference_camera(meta: dict) -> str | None:
@@ -437,7 +403,7 @@ def main() -> None:
                     help="re-run even if gyro_offsets_s already in metadata.json")
     args = ap.parse_args()
 
-    missions = find_missions(args.root)
+    missions = find_missions(args.root, exit_on_empty=True)
     print(f"Found {len(missions)} mission(s) under {args.root.resolve()}")
 
     for mission in missions:

@@ -1,7 +1,25 @@
 # Requirements
 
-- Python 3.8+
-- `ffmpeg` 
+**Python 3.8+** and **ffmpeg** (system package):
+
+```bash
+sudo apt install ffmpeg
+```
+
+**Python packages:**
+
+```bash
+pip install -r requirements.txt
+```
+
+| Package | Used by |
+|---------|---------|
+| `numpy` | `sync_gyro.py`, `overlay_stats.py`, `extract_telemetry.py` (plots) |
+| `matplotlib` | `extract_telemetry.py` (plots), `sync_gyro.py` (`--plot`) |
+| `pyyaml` | `overlay_stats.py`, `crop_missions.py` |
+| `rosbags` | `extract_ros_imu.py`, `overlay_stats.py` |
+
+`matplotlib` and `numpy` are optional for `extract_telemetry.py` — plots are skipped if not installed. `rosbags` is only needed for ROS bag workflows.
 
 Not required but a VS Code CSV editor is really nice ([ReprEng.csv](https://marketplace.visualstudio.com/items?itemName=ReprEng.csv))
 
