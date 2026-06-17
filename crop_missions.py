@@ -13,6 +13,11 @@ Behavior (mirrors compact_missions.py):
   - The pre-crop original is moved into the raw/ subfolder
   - With --lrv, the LRV proxy for each camera is cropped to {camera}_LRV.MP4 too
 
+Idempotent — crop.yaml records what's been cropped and the script self-gates on it:
+  - already cropped to the SAME window (LRV satisfied) -> skip, nothing recut
+  - crop.yaml has lrv:false and --lrv now -> add the proxies only (MP4s untouched)
+  - a DIFFERENT --start/--end -> refused unless --force (guards against recutting)
+
 Offset convention (same as sync_gyro.py / metadata.json):
   offset[C] = seconds camera C started AFTER the reference camera.
   An event at reference time t_ref is at camera time t_C = t_ref - offset[C].
@@ -169,6 +174,31 @@ def write_crop_record(mission: Path, ref: str, start_ref: float, end_ref: float,
                       yaml.safe_dump(doc, sort_keys=False, default_flow_style=False))
 
 
+def _parse_crop_yaml(crop_path: Path) -> tuple[dict, dict, tuple | None, bool]:
+    """Read crop.yaml -> (records_by_output, originals_by_output, window, lrv).
+
+    window is (start_s, end_s) or None; a corrupt file reads as empty/no-lrv.
+    """
+    records: dict[str, dict] = {}
+    originals: dict[str, str] = {}
+    window = None
+    lrv = False
+    try:
+        prev = yaml.safe_load(crop_path.read_text()) or {}
+    except Exception:
+        return records, originals, window, lrv
+    for c in prev.get("crops", []) or []:
+        out = c.get("output")
+        if out:
+            records[out] = c
+            originals[out] = c.get("original")
+    w = prev.get("window") or {}
+    if w.get("start_s") is not None and w.get("end_s") is not None:
+        window = (float(w["start_s"]), float(w["end_s"]))
+    lrv = bool(prev.get("lrv", False))
+    return records, originals, window, lrv
+
+
 def crop_mission(mission: Path, start_ref: float, end_ref: float,
                  lrv: bool, dry_run: bool, force: bool, reencode: bool) -> bool:
     meta = load_metadata(mission)
@@ -183,27 +213,57 @@ def crop_mission(mission: Path, start_ref: float, end_ref: float,
 
     raw_dir = mission / RAW_DIR
 
-    # If this mission was already cropped, re-cut from the recorded originals
-    # in raw/ rather than the (already-cropped) files in the mission folder.
+    # crop.yaml records what's already been cropped (and at what window). It both
+    # drives re-cropping (re-cut from the recorded originals in raw/, never from
+    # the already-cropped files) and gates redundant work.
     crop_path = mission / CROP_FILE
     recrop = crop_path.exists()
+    prev_records: dict[str, dict] = {}
     prev_originals: dict[str, str] = {}   # output name -> original path (relative to mission)
+    prev_window = None
+    prev_lrv = False
     if recrop:
-        try:
-            prev = yaml.safe_load(crop_path.read_text()) or {}
-            prev_originals = {c.get("output"): c.get("original")
-                              for c in prev.get("crops", [])}
-        except Exception:
-            prev_originals = {}
+        prev_records, prev_originals, prev_window, prev_lrv = _parse_crop_yaml(crop_path)
+
+    # ── gating ───────────────────────────────────────────────────────────────
+    # A present crop.yaml means this mission is done for its recorded window.
+    #   • different window → re-crop needs --force (don't silently recut footage)
+    #   • same window, LRV already satisfied → nothing to do, skip
+    #   • same window, crop.yaml has lrv:false and --lrv now → add proxies only
+    #     (keep the existing MP4 crops) and flip lrv:true afterward
+    same_window = (prev_window is not None
+                   and abs(prev_window[0] - start_ref) < 0.01
+                   and abs(prev_window[1] - end_ref) < 0.01)
+    add_lrv_only = False
+    if recrop and not force:
+        if not same_window:
+            pw = (f"{fmt_time(prev_window[0])}–{fmt_time(prev_window[1])}"
+                  if prev_window else "an unknown window")
+            print(f"  Already cropped to {pw}; requested "
+                  f"{fmt_time(start_ref)}–{fmt_time(end_ref)} differs — "
+                  "use --force to re-crop to the new window.")
+            return True
+        if lrv and not prev_lrv:
+            add_lrv_only = True
+        else:
+            print(f"  Already cropped to this window "
+                  f"({fmt_time(start_ref)}–{fmt_time(end_ref)}) — use --force to re-crop.")
+            return True
 
     print(f"  Reference camera: {ref}")
     print(f"  Window on reference: {fmt_time(start_ref)} – {fmt_time(end_ref)}  "
           f"({end_ref - start_ref:.2f}s)")
-    if recrop:
+    if add_lrv_only:
+        print(f"  {CROP_FILE} present (lrv: false) — adding LRV proxies only, "
+              "keeping existing crops.")
+    elif recrop:
         print(f"  {CROP_FILE} found — re-cropping from originals in raw/")
 
     # Build job list. Each job: dict with all info for cropping + recording.
+    # carried = records for outputs already done at this window (add-lrv mode);
+    # they're kept as-is and merged back into the rewritten crop.yaml.
     jobs: list[dict] = []
+    carried: list[dict] = []
     pre_flight_ok = True
 
     for cam in cameras:
@@ -217,6 +277,12 @@ def crop_mission(mission: Path, start_ref: float, end_ref: float,
             ("LRV", find_lrv_video,  f"{cam}_LRV.MP4"),
         ):
             if kind == "LRV" and not lrv:
+                continue
+
+            # Add-LRV-only: an output already recorded at this window is done —
+            # keep it untouched and carry its record forward (don't re-cut MP4s).
+            if add_lrv_only and out_name in prev_records:
+                carried.append(prev_records[out_name])
                 continue
 
             # Resolve the source. If this output was cropped before, re-cut from
@@ -281,8 +347,9 @@ def crop_mission(mission: Path, start_ref: float, end_ref: float,
 
     if dry_run:
         moved = sum(1 for j in jobs if j["needs_move"])
+        kept = f", keep {len(carried)} existing crop(s)" if carried else ""
         print(f"\n  [dry-run] would crop {len(jobs)} file(s), "
-              f"move {moved} original(s) to raw/, write {CROP_FILE}")
+              f"move {moved} original(s) to raw/{kept}, write {CROP_FILE}")
         return True
 
     raw_dir.mkdir(exist_ok=True)
@@ -335,7 +402,11 @@ def crop_mission(mission: Path, start_ref: float, end_ref: float,
         print("  Some crops failed — see errors above.", file=sys.stderr)
         return False
 
-    write_crop_record(mission, ref, start_ref, end_ref, method, lrv, records)
+    # Merge carried (already-done outputs, add-lrv mode) with the new crops, and
+    # derive lrv from what's actually recorded rather than the requested flag.
+    all_records = carried + records
+    final_lrv = any(r.get("kind") == "LRV" for r in all_records)
+    write_crop_record(mission, ref, start_ref, end_ref, method, final_lrv, all_records)
     print(f"  Wrote {CROP_FILE}")
     return True
 
@@ -360,7 +431,8 @@ def main() -> None:
     ap.add_argument("--execute", action="store_true",
                     help="actually perform the crop (default: dry-run)")
     ap.add_argument("--force", action="store_true",
-                    help="overwrite if a pre-crop original already exists in raw/")
+                    help="re-crop a mission already cropped to a different window, and "
+                         "overwrite a pre-crop original that already exists in raw/")
     args = ap.parse_args()
 
     if args.start < 0 or args.end < 0:

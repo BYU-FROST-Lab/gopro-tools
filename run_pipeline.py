@@ -39,8 +39,8 @@ from pathlib import Path
 
 import yaml
 
-from utils import (MISSION_MARKER, find_missions, is_mission, load_metadata,
-                   mission_compacted)
+from utils import (MISSION_MARKER, atomic_write_text, find_missions, is_mission,
+                   load_metadata, mission_compacted)
 from crop_missions import resolve_offsets
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -60,6 +60,10 @@ DEFAULT_CFG = {
     "organize": {"start_tol_s": 60.0, "dur_tol_s": 120.0},
     "sync": {"max_lag_s": 30.0, "dt_s": 0.005},
     "ros": {"topic": "/bluerov2/imu/data"},
+    # Template for the per-mission overlays.yaml that overlay_stats.py reads.
+    # bag / camera / bag_offset_s are filled in automatically per mission; the
+    # font_size, line_height and overlays list below are copied verbatim.
+    "overlay": {"font_size": 40, "line_height": 50, "overlays": []},
     "missions": {},
 }
 
@@ -137,6 +141,31 @@ def topic_name(topic: str) -> str:
     return parts[0] if parts else "ros_imu"
 
 
+def crop_lrv_flag(mission: Path) -> bool | None:
+    """The `lrv` flag recorded in the mission's crop.yaml.
+
+    Returns None if the mission hasn't been cropped yet, else the recorded bool
+    (a corrupt/half-written crop.yaml reads as False so it's treated as no-LRV).
+    """
+    p = mission / "crop.yaml"
+    if not p.exists():
+        return None
+    try:
+        return bool((yaml.safe_load(p.read_text()) or {}).get("lrv", False))
+    except Exception:
+        return False
+
+
+def crop_done(mission: Path, cfg: dict) -> bool:
+    """Crop is done only if crop.yaml exists AND it already includes LRV when
+    the current run asks for LRV. A mission cropped MP4-only is NOT done under
+    --lrv — its proxies still need cutting."""
+    lrv = crop_lrv_flag(mission)
+    if lrv is None:
+        return False
+    return lrv or not cfg["lrv"]
+
+
 def mission_state(mission: Path, cfg: dict) -> dict[str, bool]:
     """Per-mission done/not-done for each pipeline step (read-only checks).
 
@@ -157,7 +186,7 @@ def mission_state(mission: Path, cfg: dict) -> dict[str, bool]:
         "telemetry": load_metadata(mission) is not None,
         "ros": (not has_bag) or ros_csv.exists(),
         "sync": bool(meta.get("gyro_offsets_s")),
-        "crop": (mission / "crop.yaml").exists(),
+        "crop": crop_done(mission, cfg),
         "overlay": overlays_dir.is_dir() and any(overlays_dir.glob("*_stats.ass")),
     }
 
@@ -203,7 +232,7 @@ def py(*parts) -> list[str]:
 # ── crop plan (checkpoint 2) ──────────────────────────────────────────────────
 
 CROP_HEADER = ["mission", "reference_camera", "ref_duration_s",
-               "offset_source", "start", "end", "lrv", "reencode"]
+               "offset_source", "start", "end", "reencode"]
 
 
 def generate_crop_plan(root: Path, missions: list[Path], path: Path) -> int:
@@ -224,13 +253,13 @@ def generate_crop_plan(root: Path, missions: list[Path], path: Path) -> int:
             src = "sync"
         else:
             src = "none"
-        rows.append([m.name, ref, dur, src, "", "",
-                     str(False).lower(), str(False).lower()])
+        rows.append([m.name, ref, dur, src, "", "", str(False).lower()])
 
     with open(path, "w", newline="") as f:
         f.write("# crop_plan — fill start/end (sec or MM:SS or HH:MM:SS) per mission, "
                 "then re-run with --execute.\n")
-        f.write("# Blank start/end rows are skipped. lrv/reencode: true/false per mission.\n")
+        f.write("# Blank start/end rows are skipped. reencode: true/false per mission. "
+                "LRV comes from the pipeline --lrv flag / pipeline.yaml, not per mission.\n")
         w = csv.writer(f)
         w.writerow(CROP_HEADER)
         w.writerows(rows)
@@ -253,7 +282,6 @@ def read_crop_plan(path: Path) -> list[dict]:
                 "mission": row["mission"].strip(),
                 "start": start,
                 "end": end,
-                "lrv": _truthy(row.get("lrv")),
                 "reencode": _truthy(row.get("reencode")),
             })
     return out
@@ -261,6 +289,76 @@ def read_crop_plan(path: Path) -> list[dict]:
 
 def _truthy(v) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y"}
+
+
+# ── overlays.yaml generation ───────────────────────────────────────────────────
+
+def resolve_overlay_cfg(cfg: dict, mission_name: str) -> dict:
+    """The overlay template for a mission: global overlay cfg < per-mission YAML."""
+    base = dict(cfg.get("overlay", {}))
+    mov = cfg.get("missions", {}).get(mission_name, {}).get("overlay", {})
+    base.update(mov)
+    return base
+
+
+def generate_overlays_yaml(mission: Path, cfg: dict, force: bool) -> str:
+    """Write {mission}/overlays.yaml from the pipeline overlay template.
+
+    bag, camera and bag_offset_s are filled in automatically:
+      - bag         : the ROS bag discovered in the mission (path relative to it)
+      - camera      : the reference camera (offset 0.0 in metadata.json)
+      - bag_offset_s: seconds the bag started AFTER the reference camera, read
+                      from gyro_offsets_s[<bag source>] in metadata.json (the same
+                      value sync_gyro.py computes), falling back to sync_offsets_s.
+
+    The font_size / line_height / overlays list come verbatim from the template,
+    so the user edits those once in pipeline.yaml. Returns a short status string.
+    """
+    ov = resolve_overlay_cfg(cfg, mission.name)
+    template = ov.get("overlays") or []
+    if not template:
+        return "skip:no-template"
+
+    bags = find_bags(mission)
+    if not bags:
+        return "skip:no-bag"
+
+    out = mission / "overlays.yaml"
+    if out.exists() and not force:
+        return "exists"
+
+    meta = load_metadata(mission) or {}
+    ref, _ = resolve_offsets(meta)
+    camera = ref or ov.get("camera")
+
+    # bag_offset_s: prefer gyro, then creation-time sync, then template/default.
+    source = topic_name(cfg["ros"]["topic"])
+    gyro = meta.get("gyro_offsets_s", {}) or {}
+    sync = meta.get("sync_offsets_s", {}) or {}
+    if gyro.get(source) is not None:
+        bag_offset, off_src = float(gyro[source]), "gyro"
+    elif sync.get(source) is not None:
+        bag_offset, off_src = float(sync[source]), "sync"
+    else:
+        bag_offset, off_src = float(ov.get("bag_offset_s", 0.0)), "template/default"
+
+    doc = {
+        "bag": str(bags[0].relative_to(mission)),
+        "bag_offset_s": round(bag_offset, 6),
+        "camera": camera,
+        "font_size": ov.get("font_size", 40),
+        "line_height": ov.get("line_height", 50),
+        "overlays": template,
+    }
+    header = (
+        f"# overlays.yaml — auto-generated by run_pipeline.py for {mission.name}.\n"
+        f"# bag/camera/bag_offset_s filled from discovery + metadata.json "
+        f"(bag_offset_s source: {off_src}).\n"
+        f"# Edit any value by hand; re-run with --force to regenerate from "
+        f"pipeline.yaml.\n\n"
+    )
+    atomic_write_text(out, header + yaml.safe_dump(doc, sort_keys=False, allow_unicode=True))
+    return f"written:{off_src}"
 
 
 # ── status ────────────────────────────────────────────────────────────────────
@@ -405,13 +503,12 @@ def drive(root: Path, cfg: dict, selected: set[str], execute: bool, force: bool)
             print(f"\n{plan} has no filled start/end rows — nothing to crop.")
         for row in rows:
             mdir = root / row["mission"]
-            if (mdir / "crop.yaml").exists() and not force:
-                print(f"\n[skip] {row['mission']} already cropped (crop.yaml present; "
-                      "use --force to re-crop).")
-                continue
+            # crop_missions.py self-gates: it skips a mission already cropped to
+            # this window, adds LRV proxies when crop.yaml has lrv:false, and
+            # requires --force to re-cut a different window. We just invoke it.
             cmd = py(script("crop_missions.py"), mdir,
                      "--start", row["start"], "--end", row["end"])
-            if cfg["lrv"] or row["lrv"]:
+            if cfg["lrv"]:
                 cmd.append("--lrv")
             if cfg["reencode"] or row["reencode"]:
                 cmd.append("--reencode")
@@ -422,9 +519,21 @@ def drive(root: Path, cfg: dict, selected: set[str], execute: bool, force: bool)
             if not run(cmd, f"crop ({row['mission']})"):
                 return
 
-    # ── overlay (per-mission; only those with overlays.yaml) ──
+    # ── overlay (per-mission) ──
+    # Each mission's overlays.yaml is generated from the pipeline overlay template
+    # (bag/camera/bag_offset_s auto-filled), then overlay_stats.py renders the .ass.
     if "overlay" in selected:
         for m in missions:
+            status = generate_overlays_yaml(m, cfg, force)
+            if status.startswith("written"):
+                src = status.split(":", 1)[1]
+                print(f"\n[overlay] generated {m.name}/overlays.yaml from template "
+                      f"(bag_offset_s from {src}). Edit it to customize.")
+            elif status == "exists":
+                print(f"\n[overlay] {m.name}/overlays.yaml present (kept; "
+                      "--force regenerates from pipeline.yaml).")
+            # skip:no-template / skip:no-bag fall through — render only if a
+            # hand-written overlays.yaml already exists for the mission.
             if not (m / "overlays.yaml").exists():
                 continue
             cmd = py(script("overlay_stats.py"), m)
