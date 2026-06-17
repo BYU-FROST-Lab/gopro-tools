@@ -1,34 +1,44 @@
-# Requirements
+# GoPro Mission Tools
 
-**Python 3.8+** and **ffmpeg** (system package):
+A toolchain for turning raw multi-camera GoPro footage (plus optional ROS bags)
+into organized, synchronized, cropped mission clips you can play back side-by-side.
+
+The whole flow is driven by **`run_pipeline.py`**, which chains the individual
+scripts and pauses at the two points where a human decision is required. The
+walkthrough below is all you need for a normal run. Per-script options and how to
+run each step by hand are in the [Reference](#reference) section at the bottom.
+
+## Requirements
+
+**Python 3.8+**, **ffmpeg**, and (for playback) **mpv**:
 
 ```bash
-sudo apt install ffmpeg
-```
-
-**Python packages:**
-
-```bash
+sudo apt install ffmpeg mpv
 pip install -r requirements.txt
 ```
 
-| Package | Used by |
-|---------|---------|
-| `numpy` | `sync_gyro.py`, `overlay_stats.py`, `extract_telemetry.py` (plots) |
-| `matplotlib` | `extract_telemetry.py` (plots), `sync_gyro.py` (`--plot`) |
-| `pyyaml` | `overlay_stats.py`, `crop_missions.py` |
-| `rosbags` | `extract_ros_imu.py`, `overlay_stats.py` |
+`numpy`/`matplotlib` are optional (telemetry plots are skipped without them);
+`rosbags` is only needed if you have ROS bags. A VS Code CSV editor such as
+[ReprEng.csv](https://marketplace.visualstudio.com/items?itemName=ReprEng.csv)
+makes editing the review files nicer.
 
-`matplotlib` and `numpy` are optional for `extract_telemetry.py` — plots are skipped if not installed. `rosbags` is only needed for ROS bag workflows.
+---
 
-Not required but a VS Code CSV editor is really nice ([ReprEng.csv](https://marketplace.visualstudio.com/items?itemName=ReprEng.csv))
+## The workflow
 
-# GoPro Mission Organizer
+### 1. Copy the footage off the SD cards (rsync)
 
-Organizes multi-camera GoPro footage into named mission folders. Matches recordings across cameras by start time and duration, produces an editable CSV for human review, then moves files only when you approve.
+Copy each camera's card into its own subfolder under one footage root. The folder
+name becomes the camera name (e.g. `Front`, `Left`, `Right`).
 
+```bash
+./copy_file.sh -s /media/you/GOPRO_FRONT/DCIM/100GOPRO -d /path/to/footage/Front
+./copy_file.sh -s /media/you/GOPRO_LEFT/DCIM/100GOPRO  -d /path/to/footage/Left
+./copy_file.sh -s /media/you/GOPRO_RIGHT/DCIM/100GOPRO -d /path/to/footage/Right
+```
 
-## Folder structure expected
+`copy_file.sh` is a thin `rsync -avzh --progress` wrapper (resumable, verifies
+sizes). The result:
 
 ```
 footage/
@@ -37,564 +47,327 @@ footage/
   Right/    GX010167.MP4  ...
 ```
 
-Each subfolder is treated as one camera mount. The folder name becomes the suffix on renamed files (e.g. `GX010147_Front.MP4`). Camera names are discovered automatically — no configuration needed.
+If you have a ROS bag for a mission, drop it inside that mission's folder (you can
+do this after organizing). One bag per mission.
 
-## Typical workflow
+### 2. Organize into missions (human review)
 
-### 1. Dry-run to see what the script proposes
-
-```bash
-python3 organize_missions.py /path/to/footage
-```
-
-Shows a mission matrix — one row per detected mission, one column per camera — and the full list of planned moves. Nothing is changed.
-
-### 2. Export the plan to a CSV for review
+Run the pipeline. With no `--execute` it is **dry-run** — it inspects the footage,
+groups recordings across cameras into missions by start time and duration, and
+writes a reviewable plan:
 
 ```bash
-python3 organize_missions.py /path/to/footage --export /path/to/footage/mission_plan.csv
+python3 run_pipeline.py /path/to/footage
 ```
 
-Open `mission_plan.csv` in any spreadsheet app. The columns are:
+When unorganized camera folders are found it stops at **Checkpoint 1** and writes
+`/path/to/footage/mission_plan.csv`. Open it in a spreadsheet and review:
 
-| Column | Meaning |
-|--------|---------|
-| `mission (edit names)` | Folder name to create — **edit this** to name your missions |
-| `start` | Anchor recording start time |
-| `# Cameras` | How many cameras are in this mission |
-| `dur` | Anchor recording duration |
-| `dur_spread` | Max duration gap between cameras (small = confident match) |
-| `start_spread` | Max start-time gap between cameras (seconds) |
-| `Short Video` | `X` if any recording is under 30 s — likely a test clip |
-| `Single Camera` | `X` if only one camera recorded this |
-| `Near Start Tol` | `X` if start spread is close to the tolerance limit |
-| `Near Dur Tol` | `X` if duration spread is close to the tolerance limit |
-| `{Camera}` | **Editable** — video number assigned from that camera |
-| `{Camera}_Δt` | How many seconds after anchor this camera started |
+- **Rename a mission** — edit the `mission (edit names)` cell.
+- **Drop a mission** — delete its row (those files get collected into `other/`).
+- **Remove a camera from a mission** — clear that camera's video-number cell.
+- Warning columns (`Short Video`, `Single Camera`, start/dur spread, …) flag
+  uncertain matches. They are informational — the importer ignores them.
 
-**Editing rules:**
-- Rename a mission: change the `mission (edit names)` cell
-- Remove a mission: delete the entire row — those files stay in their camera folder and will be collected into `other/`
-- Remove a camera from a mission: clear its video# cell
-- The `start`, `dur`, spread, warning, and `_Δt` columns are informational — the script ignores them on import
-
-### 3. Import your edited plan and verify
+When the plan looks right, run for real. Files are **moved, never copied**:
 
 ```bash
-python3 organize_missions.py /path/to/footage --import /path/to/footage/mission_plan.csv
+python3 run_pipeline.py /path/to/footage --execute
 ```
 
-Shows the updated matrix and all planned moves. Still dry-run — nothing changes.
+### 3. Process up to the crop decision
 
-### 4. Execute
+The same `--execute` run continues automatically through the unattended steps:
+
+- **compact** — joins each camera's multi-chapter recording into one video,
+  archives the originals into `raw/`.
+- **telemetry** — extracts gyro/accel/orientation from the GoPro GPMF track into
+  `{mission}/data/`.
+- **ros** — extracts IMU from any ROS bag into the same `data/` folder.
+- **sync** — cross-correlates the gyros to measure each camera's clock offset.
+
+It then stops at **Checkpoint 2** and writes `/path/to/footage/crop_plan.csv`,
+pre-filled with each mission's reference camera and total duration. Fill in the
+**`start`** and **`end`** for every mission you want to crop (seconds, `MM:SS`, or
+`HH:MM:SS`, on the reference camera's timeline). Leave a row's start/end blank to
+skip that mission. You can also set `lrv`/`reencode` to `true` per row.
+
+> Tip: preview a window before committing it with
+> `python3 play_missions.py /path/to/footage/Mission --start 3:20` (step 5).
+
+### 4. Crop
+
+Re-run the pipeline. It reads `crop_plan.csv` and crops every camera in each
+mission to your window, keeping them synchronized via the measured offsets. The
+pre-crop originals are moved into `raw/`, and a `crop.yaml` records what was done:
 
 ```bash
-python3 organize_missions.py /path/to/footage --import /path/to/footage/mission_plan.csv --execute
+python3 run_pipeline.py /path/to/footage --execute
 ```
 
-Files are moved (never copied). The result looks like:
+To adjust a window later, just edit `crop_plan.csv` and re-run — re-cropping always
+re-cuts from the pristine originals in `raw/`, so there's no quality loss or drift.
 
-```
-footage/
-  DiveArea/
-    GX010147_Front.MP4   GL010147_Front.LRV   GX010147_Front.THM
-    GX010304_Left.MP4    GL010304_Left.LRV    GX010304_Left.THM
-    GX010167_Right.MP4   GL010167_Right.LRV   GX010167_Right.THM
-    ...
-  Plane/
-    ...
-  other/
-    GX010305_Left.MP4    ← recordings not assigned to any mission
-    ...
+### 5. Play it back
+
+Play every camera in a mission at once, tiled and synced to the same real-world
+moment:
+
+```bash
+python3 play_missions.py /path/to/footage/Mission
+python3 play_missions.py /path/to/footage/Mission --start 3:20 --speed 0.5
+python3 play_missions.py /path/to/footage/Mission --lrv      # low-res proxies
 ```
 
-A hidden `.gopro_mission` marker file is written into each output folder so the script won't treat them as camera inputs on future runs.
+One mpv window opens per camera. Only the reference camera plays audio (`--no-mute`
+for all). Any stats overlays generated by `overlay_stats.py` are loaded
+automatically.
 
-## All flags
+### Checking progress
+
+```bash
+python3 run_pipeline.py /path/to/footage --status
+```
+
+prints a missions × steps matrix (`✓` done, `·` pending, `—` not applicable).
+
+---
+
+# Reference
+
+Everything below is optional detail: each script can be run on its own, and these
+are its flags and behaviors. The pipeline above invokes them for you.
+
+## run_pipeline.py
+
+Dry-run by default; `--execute` runs for real and pauses at the two checkpoints.
+
+```
+python3 run_pipeline.py <root> [options]
+
+  --execute              actually run (default: dry-run / plan only)
+  --status               print the missions × steps matrix and exit
+  --only STEP            run a single step
+  --from STEP --to STEP  run a contiguous range
+  --skip a,b             skip steps
+  --lrv                  also process LRV proxies where applicable
+  --reencode             frame-accurate crops (re-encode instead of stream copy)
+  --no-plots             skip telemetry plots
+  --max-lag S / --dt S   sync_gyro tuning (override config)
+  --ros-topic TOPIC      IMU topic for extract_ros_imu
+```
+
+Step order: `organize, compact, telemetry, ros, sync, crop, overlay`. Each step
+self-skips missions it has already completed, so re-running is safe. Optional
+`pipeline.yaml` at the root holds global and per-mission overrides (CLI flags win),
+e.g. `missions.Plane.sync.max_lag_s: 200`.
+
+**Overlays are generated from the pipeline config.** You do not hand-write each
+mission's `overlays.yaml`. Put the overlay template once under `overlay:` in
+`pipeline.yaml`, and the overlay step writes a per-mission `overlays.yaml` for every
+mission that has a ROS bag, auto-filling `bag` (discovered in the mission), `camera`
+(the reference camera), and `bag_offset_s` (seconds the bag started after the
+reference camera, read from `gyro_offsets_s` in `metadata.json` — the value
+`sync_gyro.py` measures). `font_size`, `line_height`, and the `overlays` list are
+copied verbatim from the template. An existing `overlays.yaml` is left untouched so
+your manual edits survive re-runs; pass `--force` to regenerate it from the template.
+
+```yaml
+# pipeline.yaml
+overlay:
+  font_size: 150          # 40+ for 5K, 16-20 for LRV
+  line_height: 170
+  overlays:               # copied verbatim into every mission's overlays.yaml
+    - topic: /bluerov2/shallow/depth/odom
+      field: pose.pose.position.z
+      label: "Depth Z"
+      unit: "m"
+      format: ".2f"
+      position: top-left
+      color: "#00CCFF"
+```
+
+Per-mission overrides go under `missions.<name>.overlay` (e.g. a different
+`font_size` for one mission).
+
+## organize_missions.py
+
+Groups recordings across cameras into missions and moves files into named folders
+after CSV review.
 
 ```
 python3 organize_missions.py <root> [options]
 
-  --export FILE       Export auto-clustered plan to CSV for review
-  --import FILE       Load missions from an edited CSV instead of auto-clustering
-  --execute           Actually move files (default is dry-run)
-  --no-other          Leave unassigned recordings in place instead of moving to other/
-  --timeline          Print per-recording metadata debug table (shows ffprobe/mtime source)
-  --verbose           Print expanded per-recording detail inside each mission
-  --start-tol N       Max start-time gap in seconds to group recordings (default 60)
-  --dur-tol N         Max duration difference in seconds to group recordings (default 120)
+  --export FILE     export the auto-clustered plan to CSV for review
+  --import FILE     load missions from an edited CSV instead of auto-clustering
+  --execute         actually move files (default: dry-run)
+  --no-other        leave unassigned recordings in place instead of moving to other/
+  --timeline        print per-recording metadata debug table
+  --verbose         expanded per-recording detail per mission
+  --start-tol N     max start-time gap (s) to group recordings (default 60)
+  --dur-tol N       max duration difference (s) to group recordings (default 120)
 ```
 
-## Tunable parameters (top of script)
+Each output folder gets a hidden `.gopro_mission` marker so it's skipped as a
+camera input on re-runs. Files sharing a 4-digit video number across chapter
+numbers (`GX01…`, `GX02…`) are one recording and move together with their LRV/THM.
 
-```python
-START_TOL_S   = 60.0   # max start-time gap to call two recordings the same mission
-DUR_TOL_S     = 120.0  # max duration difference to call two recordings the same mission
-WARN_TOL_FRAC = 0.6    # warn when spread exceeds this fraction of the tolerance
-SHORT_WARN_S  = 30.0   # warn if any recording is shorter than this (seconds)
-MISSION_PREFIX = ""    # prepended to every mission folder name; "" = no prefix
-```
+## compact_missions.py
 
-## GoPro filename convention
-
-```
-GX + CC + NNNN + .MP4    (video chapter — CC is 2-digit chapter, NNNN is 4-digit video#)
-GL + CC + NNNN + .LRV    (low-res proxy)
-GX + CC + NNNN + .THM    (thumbnail)
-```
-
-Files sharing the same `NNNN` across multiple chapter numbers (`GX01`, `GX02`, `GX03`, …) are treated as one continuous recording. All chapters, proxies, and thumbnails for a recording move together.
-
----
-
-# GoPro Mission Compactor
-
-After organizing footage with `organize_missions.py`, run `compact_missions.py` to concatenate chapter files from each camera into single videos, and archive the originals.
-
-GoPros split long recordings into ~4 GB chapters (`GX01`, `GX02`, `GX03`, …). This script joins them back into one file per camera per mission.
-
-## Typical workflow
-
-### 1. Dry-run to see what will happen
-
-```bash
-python3 compact_missions.py /path/to/footage
-```
-
-Shows what would be concatenated and moved for every mission folder. Nothing is changed.
-
-### 2. Execute
-
-```bash
-python3 compact_missions.py /path/to/footage --execute
-```
-
-For each mission folder:
-
-- **Multi-chapter cameras** (e.g. `GX010147_Front.MP4` + `GX020147_Front.MP4`): concatenated into `Front.MP4` using lossless stream copy. Originals move to `raw/`.
-- **Single-chapter cameras** (e.g. `GX010149_Front.MP4`): left exactly as-is with the original GX filename.
-- **LRV proxy files**: always moved to `raw/` (they are already compressed — see `--lrv` below).
-- **THM thumbnail files**: always moved to `raw/`.
-
-Result:
-
-```
-footage/
-  DiveArea/
-    Front.MP4                 ← concatenated full-res (3 chapters joined)
-    GX010304_Left.MP4         ← single chapter, left as-is
-    GX010167_Right.MP4        ← single chapter, left as-is
-    raw/
-      GX010147_Front.MP4      ← original chapter 1
-      GX020147_Front.MP4      ← original chapter 2
-      GX030147_Front.MP4      ← original chapter 3
-      GL010147_Front.LRV      ← all LRV files
-      GX010147_Front.THM      ← all THM files
-      ...
-      .gopro_mission
-    .gopro_mission
-```
-
-### 3. Execute with LRV proxy compilation (optional)
-
-```bash
-python3 compact_missions.py /path/to/footage --execute --lrv
-```
-
-LRV files are low-resolution proxy videos (already compressed by the GoPro). With `--lrv`:
-
-- **Multi-chapter LRVs**: concatenated into `Front_LRV.MP4` (MP4 extension so any player opens it).
-- **Single-chapter LRVs**: renamed in-place from `GL010147_Front.LRV` → `GL010147_Front_LRV.MP4`. Not moved to `raw/`.
-- Multi-chapter LRV originals still move to `raw/`.
-
-## All flags
+Concatenates each camera's chapters into one video (lossless stream copy) and
+archives originals to `raw/`.
 
 ```
 python3 compact_missions.py <root> [options]
 
-  --execute       Actually perform operations (default is dry-run)
-  --lrv           Also process LRV proxy files (concat multi-chapter, rename single-chapter)
-  --force         Overwrite existing output files
+  --execute   actually perform operations (default: dry-run)
+  --lrv       also concatenate/rename LRV proxies into {camera}_LRV.MP4
+  --force     overwrite existing output files
 ```
 
----
+Single-chapter cameras are left as-is with their `GX…` name. LRV and THM files
+move to `raw/` (LRVs are concatenated instead when `--lrv` is given).
 
-# Synchronized Multi-Camera Crop
+> Note: the compacted `{camera}.MP4` drops the GPMF telemetry track in practice, so
+> `extract_telemetry.py` reads from the chapter files in `raw/`, which keep it.
 
-`crop_missions.py` crops every camera in a mission to a single time window that you specify on the **reference camera's** timeline. Each other camera is cropped to the same real-world moments using its measured clock offset, so the resulting clips stay in sync.
+## extract_telemetry.py
 
-You give times relative to the reference video (the one with offset 0.0 in `metadata.json`). The script applies each camera's offset automatically — preferring the gyro-derived offset (`gyro_offsets_s`, sub-frame accurate) and falling back to the creation-time offset (`sync_offsets_s`) when no gyro offset exists.
-
-Requires `data/metadata.json` with sync offsets — run `extract_telemetry.py` and `sync_gyro.py` first.
-
-### 1. Dry-run (default) to preview the plan
-
-```bash
-python3 crop_missions.py /path/to/Mission --start 200 --end 400
-```
-
-Times accept seconds (`200`), `MM:SS` (`3:20`), or `HH:MM:SS` (`1:03:20`). Example output:
+Pulls gyro/accel/gravity/orientation (and GPS, if present) from the GoPro GPMF
+track into `{mission}/data/` as CSVs and plots.
 
 ```
-[Plane]
-  Reference camera: Front
-  Window on reference: 3:20.000 – 6:40.000  (200.00s)
-  Front MP4: Front.MP4  offset=REF
-      crop 3:20.000 +200.00s -> Front.MP4
-  Left MP4: GX010306_Left.MP4  offset=+6.581s [gyro]
-      crop 3:13.419 +200.00s -> Left.MP4
-  Right MP4: GX010168_Right.MP4  offset=+4.675s [gyro]
-      crop 3:15.325 +200.00s -> Right.MP4
+python3 extract_telemetry.py <root> [--force] [--no-plots]
 ```
 
-### 2. Include LRV proxies
+Output: `metadata.json`, `{camera}_{gyro,accl,grav,cori,iori}.csv`, a `.gpx` if GPS
+is present, and `plots/`. `--force` re-extracts a mission that already has `data/`.
+These cameras (HERO11 Black) have GPS disabled, so no GPS5 stream appears.
 
-```bash
-python3 crop_missions.py /path/to/Mission --start 200 --end 400 --lrv
+## sync_gyro.py
+
+Estimates each camera's clock offset from the reference by cross-correlating
+gyroscope magnitude `|ω|`. Writes `gyro_offsets_s` into `metadata.json`.
+
+```
+python3 sync_gyro.py <root> [options]
+
+  --max-lag S   max offset to search, seconds (default 30)
+  --dt S        resampling interval, seconds (default 0.005 = 200 Hz)
+  --plot        show cross-correlation plots (matplotlib)
+  --dry-run     print results without writing metadata.json
+  --force       re-run even if gyro_offsets_s already present
 ```
 
-Also crops each camera's LRV proxy to `{camera}_LRV.MP4`.
+Any `*_gyro.csv` in `data/` is included automatically — including
+`bluerov2_gyro.csv` from a ROS bag. Increase `--max-lag` when a bag starts well
+after the cameras (e.g. `--max-lag 200`).
 
-### 3. Execute
+## extract_ros_imu.py
 
-```bash
-python3 crop_missions.py /path/to/Mission --start 200 --end 400 --lrv --execute
+Reads a `sensor_msgs/msg/Imu` topic from a ROS bag and writes `{name}_gyro.csv` /
+`{name}_accl.csv` in the same format as the telemetry extractor, so `sync_gyro.py`
+consumes them directly. Supports ROS1 `.bag` and ROS2 `.db3`/`.mcap`. Needs
+`rosbags`.
+
+```
+python3 extract_ros_imu.py <root|bag_dir> [options]
+
+  --topic TOPIC   IMU topic (default /bluerov2/imu/data)
+  --out DIR       output directory (default: the bag's mission data/ folder)
+  --force         overwrite existing CSVs
 ```
 
-For each camera:
-- The cropped video is written as `{camera}.MP4` (and `{camera}_LRV.MP4`)
-- The pre-crop original is moved into `raw/`
+Pointed at a footage root it finds every bag and writes into each mission's
+`data/`. One bag per mission. Units match GoPro (rad/s, m/s²) — no conversion. The
+sensor's `header.stamp` is used, not the bag record time.
 
-If the mission has an `overlays.yaml`, the script also prints the matching `overlay_stats.py --crop-offset` command to regenerate the stats overlay aligned to the cropped clip (see [Subclip alignment](#subclip-alignment)).
+## crop_missions.py
 
-### The crop record (`crop.yaml`) and re-cropping
+Crops every camera in a mission to one window given on the **reference** camera's
+timeline; other cameras are cut to the same real-world moments via their measured
+offset (gyro offset preferred, creation-time offset as fallback).
 
-On execute, the script writes a `crop.yaml` into the mission folder recording exactly what was done — the reference camera, the window (on the reference timeline), the method, and per-camera details including where each original now lives in `raw/`:
+```
+python3 crop_missions.py <mission> --start T --end T [options]
+
+  --start T / --end T   window on the reference timeline (sec / MM:SS / HH:MM:SS)
+  --lrv                 also crop LRV proxies to {camera}_LRV.MP4
+  --reencode            frame-accurate crop (re-encode); default is fast stream copy
+  --execute             actually crop (default: dry-run)
+  --force               overwrite if a pre-crop original already exists in raw/
+```
+
+Requires `data/metadata.json` with offsets (run telemetry + sync first). Cropped
+output is `{camera}.MP4`; the original moves to `raw/`. A `crop.yaml` records the
+window and each original's `raw/` path — re-running with a new window re-cuts from
+those pristine originals. Cameras whose window falls outside their footage are
+clamped (with a warning). Cropped clips keep video + audio only; telemetry already
+lives in `data/`.
+
+## overlay_stats.py
+
+Generates an ASS subtitle file overlaying any ROS bag topic/field on a video — no
+re-encoding. Load the `.ass` alongside the video in mpv/VLC/Resolve (and
+`play_missions.py` picks it up automatically). Needs `pyyaml`.
+
+```
+python3 overlay_stats.py <mission> [options]
+
+  --list-topics      list topics in the bag and exit
+  --config PATH      alternate config location
+  --camera NAME      override the camera from config
+  --start T --end T  align to a clip trimmed from the full video
+  --crop-offset T    align to a clip already cropped by crop_missions.py (T = crop --start)
+  --force            overwrite existing output
+  --dry-run          print the plan without writing
+```
+
+Reads `overlays.yaml` from the mission folder. `run_pipeline.py` generates this
+file for you from the `overlay:` template in `pipeline.yaml` (auto-filling `bag`,
+`camera`, and `bag_offset_s`); write it by hand only if you run `overlay_stats.py`
+standalone. Format:
 
 ```yaml
-reference_camera: Front
-window:
-  start_s: 665.0
-  end_s: 1680.0
-  duration_s: 1015.0
-  start_hms: '11:05.000'
-  end_hms: '28:00.000'
-method: stream-copy
-lrv: true
-crops:
-  - camera: Front
-    output: Front.MP4
-    original: raw/Front.MP4
-    offset_s: 0.0
-    offset_src: ref
-    crop_start_s: 665.0
-    crop_dur_s: 1015.0
-  - camera: Left
-    output: Left.MP4
-    original: raw/GX010306_Left.MP4
-    offset_s: 6.581
-    offset_src: gyro
-    crop_start_s: 658.419
-    crop_dur_s: 1015.0
-  # ...
-```
-
-**To change the crop, just run it again with a new window.** When a `crop.yaml` exists, the script re-cuts from the pristine **originals in `raw/`** (not the already-cropped files), so you can adjust the window as many times as you like without quality loss or drift:
-
-```bash
-python3 crop_missions.py /path/to/Mission --start 700 --end 1500 --lrv --execute
-```
-
-The originals in `raw/` are never touched, and `crop.yaml` is rewritten with the new window. `metadata.json` is never modified — it keeps describing the originals.
-
-### Crop accuracy: stream copy vs. re-encode
-
-By default the crop uses **stream copy** — fast and lossless, but each cut lands on the nearest keyframe at or before the requested start (sub-second imprecision, and it can differ slightly per camera).
-
-Cropped clips contain video + audio only; the GoPro timecode and GPMF telemetry data streams are dropped (telemetry is already extracted to the `data/` CSVs).
-
-For frame-accurate cuts, add `--reencode` (re-encodes video with libx265, copies audio):
-
-```bash
-python3 crop_missions.py /path/to/Mission --start 200 --end 400 --reencode --execute
-```
-
-This is much slower on full-res 5K footage. A common workflow is to crop the LRV proxies frame-accurately for review (`--lrv --reencode`) and stream-copy the full-res files.
-
-### All flags
-
-```
-python3 crop_missions.py MISSION --start T --end T [options]
-
-  --start T       window start on reference timeline (sec / MM:SS / HH:MM:SS)
-  --end T         window end on reference timeline
-  --lrv           also crop LRV proxy videos
-  --reencode      frame-accurate crop via re-encode (default: fast stream copy)
-  --execute       actually perform the crop (default: dry-run)
-  --force         overwrite if a pre-crop original already exists in raw/
-```
-
-`MISSION` may be a single mission folder or a parent folder containing several — missions without sync offsets are skipped.
-
-### Edge cases
-
-If the window starts before a camera began recording (or ends after it stopped), that camera's clip is clamped to its available footage and a warning is printed. The clamped clip aligns at the end (for a late start) or at the start (for an early end).
-
----
-
-# GoPro Telemetry Extractor
-
-After compacting missions, run `extract_telemetry.py` to pull gyroscope, accelerometer, gravity, and orientation data out of the GPMF track embedded in each GoPro MP4 and write them to `{mission}/data/` as CSVs and plots.
-
-```bash
-python3 extract_telemetry.py /path/to/footage
-```
-
-Re-extract a mission that already has a `data/` folder:
-
-```bash
-python3 extract_telemetry.py /path/to/footage --force
-```
-
-Output written per mission:
-
-```
-{mission}/data/
-  metadata.json          ← sizes, durations, creation times, sync offsets
-  {camera}_gyro.csv      ← t_s, gx_rads, gy_rads, gz_rads
-  {camera}_accl.csv      ← t_s, ax_ms2, ay_ms2, az_ms2
-  {camera}_grav.csv      ← t_s, gx, gy, gz  (normalised gravity)
-  {camera}_cori.csv      ← t_s, w, x, y, z  (camera orientation quaternion)
-  {camera}_iori.csv      ← t_s, w, x, y, z  (image orientation quaternion)
-  plots/
-    all_cameras_accel_magnitude.png
-    {camera}_accl.png
-    {camera}_gyro.png
-    ...
-```
-
----
-
-# Inter-Camera Sync (gyroscope cross-correlation)
-
-`sync_gyro.py` estimates how many seconds each camera's clock was ahead of or behind the reference camera, using the gyroscope magnitude `|ω| = √(gx²+gy²+gz²)`. Because all cameras are rigidly mounted, they share the same rotation — cross-correlating `|ω|` finds the clock offset without needing to know the physical rotation between cameras.
-
-Results are written into `{mission}/data/metadata.json` as `gyro_offsets_s`.
-
-```bash
-python3 sync_gyro.py /path/to/footage
-```
-
-Options:
-
-```
-  --max-lag S    Maximum offset to search in seconds (default: 30)
-  --dt S         Resampling interval in seconds (default: 0.005 = 200 Hz)
-  --plot         Show diagnostic cross-correlation plots (requires matplotlib)
-  --dry-run      Print results without writing to metadata.json
-  --force        Re-run even if gyro_offsets_s already present
-```
-
----
-
-# ROS Bag IMU Extraction
-
-`extract_ros_imu.py` reads a `sensor_msgs/msg/Imu` topic from a ROS bag and writes gyro and accel CSVs in the same format as `extract_telemetry.py`. Placing the output in a mission's `data/` folder lets `sync_gyro.py` automatically cross-correlate the ROS IMU against the GoPro cameras to find the bag-to-camera time offset.
-
-Supports ROS1 (`.bag`) and ROS2 (`.db3` / `.mcap`) bag files. Requires the `rosbags` Python package.
-
-### Install
-
-```bash
-pip install rosbags
-```
-
-### Scan an entire footage directory (typical usage)
-
-Pass the root folder containing all mission subfolders. The script finds every ROS bag and writes CSVs into the corresponding mission's `data/` folder automatically:
-
-```bash
-python3 extract_ros_imu.py /path/to/footage/
-```
-
-Each mission is expected to contain exactly one ROS bag. Already-extracted missions are skipped:
-
-```
-Found 5 bag(s) under /path/to/footage
-  ball_3.0-...: reading /bluerov2/imu/data ...
-    216299 samples  1088.5 s  ~199 Hz
-    → .../Ball/data/bluerov2_gyro.csv
-    → .../Ball/data/bluerov2_accl.csv
-  plane_2.0-...: already extracted — skipping (use --force to overwrite)
-...
-Done — 4/5 bag(s) extracted.
-```
-
-### Single bag
-
-```bash
-python3 extract_ros_imu.py /path/to/MissionName/bag_directory/
-```
-
-Writes CSVs to `MissionName/data/` by default, or to a custom location with `--out`:
-
-```bash
-python3 extract_ros_imu.py /path/to/bag_directory/ --out /custom/output/dir/
-```
-
-### Custom topic
-
-```bash
-python3 extract_ros_imu.py /path/to/footage/ --topic /my_robot/imu/data
-```
-
-If the topic is not found in a bag, the script prints the available topics and continues to the next bag.
-
-### ROS2 multi-file bags
-
-ROS2 bags are often split into many `.mcap` segments inside a single directory (with a `metadata.yaml` alongside them). Pass the **directory**, not an individual file — this is the default layout and is handled automatically.
-
----
-
-# Video Stats Overlay (ASS subtitles)
-
-`overlay_stats.py` generates an ASS subtitle file that overlays live ROS bag data on your GoPro video — no re-encoding needed. Works with any ROS topic and any message field. Load the `.ass` file alongside the video in VLC, mpv, or DaVinci Resolve.
-
-### Install
-
-```bash
-pip install pyyaml
-```
-
-### 1. Discover what topics are in your bag
-
-```bash
-python3 overlay_stats.py /path/to/MissionName --list-topics
-```
-
-### 2. Create a config file
-
-Create `overlays.yaml` in the mission folder:
-
-```yaml
-bag: bag_directory_name         # ROS2 bag dir (relative to mission) or absolute path
-bag_offset_s: 150.045           # seconds the bag started AFTER the GoPro reference camera
-camera: Front                   # which camera's video to target
-
-font_size: 40     # 40+ for 5K video; 16-20 for LRV proxy
-line_height: 50   # vertical spacing between stacked overlays
-
+bag: bag_directory_name      # relative to mission, or absolute
+bag_offset_s: 150.045        # seconds the bag started AFTER the reference camera
+camera: Front
+font_size: 40                # 40+ for 5K; 16-20 for LRV
+line_height: 50
 overlays:
   - topic: /bluerov2/imu/data
-    field: angular_velocity.x   # dot-notation into the message (supports array[0] indexing)
+    field: angular_velocity.x   # dot-notation; supports array[0] indexing
     label: "Gyro X"
     unit: "rad/s"
     format: ".3f"
-    position: top-left          # top-left / top-right / bottom-left / bottom-right / top-center / bottom-center
+    position: top-left          # …/top-right/bottom-left/bottom-right/top-center/bottom-center
     color: "#00FF00"
-
-  - topic: /bluerov2/dvl/data
-    field: velocity.x
-    label: "DVL Vx"
-    unit: "m/s"
-    format: ".3f"
-    position: top-right
-    color: "#FF8800"
 ```
 
-Multiple overlays at the same `position` stack vertically. `enabled: false` hides an overlay without deleting it.
+Output: `{mission}/overlays/{camera}_stats.ass`. After a crop, `crop_missions.py`
+prints the exact `--crop-offset` command to regenerate an aligned overlay.
 
-### 3. Generate the subtitle file
-
-```bash
-python3 overlay_stats.py /path/to/MissionName
-```
-
-Output: `MissionName/overlays/Front_stats.ass`
-
-### 4. View with mpv
-
-```bash
-mpv Front_LRV.MP4 --sub-file=overlays/Front_stats.ass
-```
-
-Or in VLC: **Subtitle → Add Subtitle File**. In DaVinci Resolve: import as a subtitle track.
-
-### Subclip alignment
-
-There are two ways to align the overlay with a trimmed clip:
-
-**Before cropping** — generate against the full video with `--start` / `--end`. Output timestamps are shifted to start at t=0, matching a clip you'll trim to that range:
-
-```bash
-python3 overlay_stats.py /path/to/MissionName --start 200 --end 600
-```
-
-**After cropping with `crop_missions.py`** — use `--crop-offset` set to the crop's `--start`. This adjusts the bag alignment for a video that already begins partway into the original timeline (it subtracts the offset from `bag_offset_s`):
-
-```bash
-# you cropped with: crop_missions.py MissionName --start 200 --end 600 --execute
-python3 overlay_stats.py /path/to/MissionName --crop-offset 200 --force
-```
-
-`crop_missions.py` prints this exact command after a crop when an `overlays.yaml` is present.
-
-### Other options
+## play_missions.py
 
 ```
-  --config PATH     alternate config file location
-  --camera NAME     override camera from config
-  --force           overwrite existing output
-  --dry-run         print plan without writing files
+python3 play_missions.py <mission> [options]
+
+  --start T     start on the reference timeline (sec / MM:SS / HH:MM:SS)
+  --speed X     playback speed multiplier (default 1.0)
+  --lrv         play LRV proxies instead of full-res MP4
+  --no-sync     ignore offsets; start every camera at --start
+  --no-mute     play audio from every window (default: reference only)
+  --no-tile     don't auto-tile windows into a grid
+  --subs MODE   overlay subtitles: all (default) / none / a camera name
+  --dry-run     print the mpv commands without launching
 ```
 
-**Font size guidance:** The overlay uses `PlayResX/Y` set to the video's actual resolution. At 5K (5312×2988), use `font_size: 40`+. For LRV proxies (~540p), use `font_size: 16`–`20`.
+## Safety conventions
 
-**N/A display:** Values show "N/A" when the video timestamp falls before the bag started or after it ended. The `bag_offset_s` in the config controls this boundary — get the value from `sync_gyro.py` output.
-
----
-
-### Syncing the ROS IMU against GoPro cameras
-
-Once the CSV is in `data/`, run `sync_gyro.py` as normal. If the bag started more than 30 s into the GoPro recording, increase `--max-lag` accordingly:
-
-```bash
-python3 sync_gyro.py /path/to/MissionName --max-lag 200 --dry-run
-```
-
-The output includes the ROS IMU offset against the reference camera and pairwise consistency checks against every other camera.
-
-**Units:** Both the GoPro GPMF stream and `sensor_msgs/Imu` report gyro in **rad/s** and accel in **m/s²** — no conversion is needed.
-
-**Timestamp note:** The script uses `msg.header.stamp` (the sensor's own clock), not the bag record timestamp. The bag timestamp lags the header stamp by 4–25 ms due to OS scheduling jitter and is not suitable for precision synchronisation.
-
----
-
-## GPS and telemetry data
-
-GoPro cameras embed GPS, gyroscope, accelerometer, and temperature data as a **GPMF** (GoPro Metadata Format) binary track inside the MP4 container alongside the video and audio. This script uses **lossless stream copy** (`ffmpeg -c copy`), which preserves the GPMF track completely — GPS data is not lost during concatenation.
-
-To extract the GPS track from a concatenated file to a standard GPX file:
-
-```bash
-pip install gopro2gpx
-gopro2gpx -s Front.MP4 Front.gpx
-```
-
-Note: `exiftool -GPS* Front.MP4` shows only the starting-point coordinates. For the full GPS track, use `gopro2gpx`.
-
-## Safety
-
-- **Dry-run by default.** `--execute` must be passed explicitly.
-- **Originals protected.** Files are only moved to `raw/` after the output is verified to exist and have a non-zero size. If ffmpeg fails, nothing is moved.
-- **Idempotent.** If `raw/` already exists in a mission folder, the script skips it. Re-running is safe.
-- **Already-organized folders only.** Only folders containing a `.gopro_mission` marker (written by `organize_missions.py --execute`) are processed.
-
----
-
-## Safety
-
-- **Dry-run by default.** `--execute` must be passed explicitly.
-- **Pre-flight check.** Before moving anything, the script verifies no two files would land on the same destination and no source has vanished.
-- **Moves, never copies.** Files are not duplicated.
-- **Re-runnable.** Output folders are excluded from camera discovery via the `.gopro_mission` marker, so re-running on a partially organized folder is safe.
+- **Dry-run by default** everywhere; `--execute` (or the lack of `--dry-run`) is
+  always explicit.
+- **Moves, never copies**, and originals are only moved to `raw/` after the new
+  output is verified non-empty. Outputs are written to temp files and atomically
+  renamed, so an interrupted run never leaves a corrupt final file.
+- **Idempotent.** Completed steps are detected by their final artifact and skipped,
+  so re-running the pipeline is safe.
