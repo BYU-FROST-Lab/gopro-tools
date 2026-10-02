@@ -29,6 +29,9 @@ Usage:
 Per-step settings come from CLI flags or an optional pipeline.yaml at the root
 (CLI flag > per-mission YAML override > global YAML > built-in default).
 """
+# TODO this does some janky stuff with running some scripts on the entire parent folder
+# Some it does on just a single mission folder
+
 
 import argparse
 import csv
@@ -89,6 +92,10 @@ def load_config(root: Path, config_path: Path | None, args) -> dict:
     cfg["plots"] = bool(cfg.get("plots", True)) and not args.no_plots
     if args.ros_topic is not None:
         cfg["ros"]["topic"] = args.ros_topic
+    if args.start_tol is not None:
+        cfg["organize"]["start_tol_s"] = args.start_tol
+    if args.dur_tol is not None:
+        cfg["organize"]["dur_tol_s"] = args.dur_tol
     # Per-mission max-lag/dt come from YAML; a CLI value (if given) wins for all.
     cfg["_cli_max_lag"] = args.max_lag
     cfg["_cli_dt"] = args.dt
@@ -292,6 +299,26 @@ def _truthy(v) -> bool:
 
 
 # ── overlays.yaml generation ───────────────────────────────────────────────────
+
+def crop_start_s(mission: Path) -> float | None:
+    """Reference-timeline crop start from crop.yaml, or None if not cropped.
+
+    This is exactly the --crop-offset overlay_stats.py needs: after a crop the
+    {camera}.MP4 in the mission folder begins this many seconds into the original
+    reference timeline, so bag_offset_s (which is on that original timeline) must
+    be shifted back by it. A corrupt/half-written crop.yaml reads as None.
+    """
+    p = mission / "crop.yaml"
+    if not p.exists():
+        return None
+    try:
+        with open(p) as f:
+            doc = yaml.safe_load(f) or {}
+        start = (doc.get("window") or {}).get("start_s")
+        return None if start is None else float(start)
+    except (OSError, ValueError, yaml.YAMLError):
+        return None
+
 
 def resolve_overlay_cfg(cfg: dict, mission_name: str) -> dict:
     """The overlay template for a mission: global overlay cfg < per-mission YAML."""
@@ -537,6 +564,12 @@ def drive(root: Path, cfg: dict, selected: set[str], execute: bool, force: bool)
             if not (m / "overlays.yaml").exists():
                 continue
             cmd = py(script("overlay_stats.py"), m)
+            # If the mission has been cropped, the rendered video is the cropped
+            # clip but bag_offset_s is on the original reference timeline — pass the
+            # crop start so overlay_stats.py shifts the bag offset to match.
+            cstart = crop_start_s(m)
+            if cstart:
+                cmd += ["--crop-offset", str(cstart)]
             if not execute:
                 cmd.append("--dry-run")
             if force:
@@ -580,6 +613,11 @@ def main() -> None:
     cfg.add_argument("--dt", type=float, default=None,
                      help="sync_gyro resample interval (s)")
     cfg.add_argument("--ros-topic", default=None, help="ROS IMU topic to extract")
+    cfg.add_argument("--start-tol", type=float, default=None,
+                     help="organize: max start-time gap in seconds; "
+                          "0 = unlimited (ignore start times, match on duration alone)")
+    cfg.add_argument("--dur-tol", type=float, default=None,
+                     help="organize: max duration difference in seconds")
     cfg.add_argument("--config", type=Path, default=None,
                      help=f"Pipeline config (default: {{root}}/{PIPELINE_CFG})")
 

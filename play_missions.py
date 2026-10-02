@@ -126,7 +126,8 @@ def play_mission(mission: Path, start_ref: float, lrv: bool, speed: float,
         tag = "REF" if is_ref else (f"start {start_c:.2f}s" if start_c else "start 0s")
         print(f"  {cam}: {src.name}  ({tag})")
 
-        cmd = ["mpv", f"--start={start_c:.3f}", f"--speed={speed:g}",
+        # TODO issue with my hwdec
+        cmd = ["mpv", "--hwdec=nvdec", f"--start={start_c:.3f}", f"--speed={speed:g}",
                f"--title={mission.name}/{cam}"]
         if geom:
             cmd.append(f"--geometry={geom}")

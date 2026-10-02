@@ -45,6 +45,7 @@ class OverlaySpec:
     an: int = 7       # ASS numpad alignment (7=top-left, 9=top-right, etc.)
     stack_index: int = 0
     style_name: str = ""
+    scale: float = 1.0
 
 
 # Named anchors: (base_x, base_y, ASS \an value, bottom_stacking)
@@ -111,6 +112,7 @@ def build_specs(cfg: dict) -> list[OverlaySpec]:
                 x=int(pos[0]), y=int(pos[1]),
                 an=7,
                 style_name=color_to_style[color],
+                scale=oc.get("scale", 1.0),
             )
         elif pos in _ANCHORS:
             spec = OverlaySpec(
@@ -121,6 +123,7 @@ def build_specs(cfg: dict) -> list[OverlaySpec]:
                 color=color,
                 anchor=pos,
                 style_name=color_to_style[color],
+                scale=oc.get("scale", 1.0),
             )
         else:
             sys.exit(f"error: unknown position '{pos}'. Use a named anchor or [x, y] list.")
@@ -142,7 +145,14 @@ def resolve_positions(specs: list[OverlaySpec], W: int, H: int, line_height: int
         spec.stack_index = anchor_count.get(spec.anchor, 0)
         anchor_count[spec.anchor] = spec.stack_index + 1
 
-        x = (W // 2) if base_x is None else base_x
+        # base_x None → derive from horizontal alignment encoded in `an`
+        # (numpad: an%3 == 1 left, 2 center, 0 right)
+        if base_x is not None:
+            x = base_x
+        elif an % 3 == 2:
+            x = W // 2
+        else:  # right-aligned anchor
+            x = W - _MARGIN
         y = (H - _MARGIN) if base_y is None else base_y
 
         if bottom:
@@ -362,7 +372,8 @@ def generate_ass(
             if t_bag < 0.0 or t_bag > t_arr[-1]:
                 text = f"{spec.label}: N/A"
             else:
-                val = float(np.interp(t_bag, t_arr, v_arr))
+                # TODO is it interpolating here. Probs dont want this fake data.
+                val = float(np.interp(t_bag, t_arr, v_arr)) * spec.scale
                 text = f"{spec.label}: {format(val, spec.fmt)} {spec.unit}"
 
             if text != prev_text[i]:

@@ -47,6 +47,7 @@ from utils import (
 # TUNABLE PARAMETERS  (override on the command line; see argparse below)
 # ---------------------------------------------------------------------------
 START_TOL_S   = 60.0   # max start-time gap (seconds) to call recordings the same mission
+                       # 0 = unlimited: ignore start times, cluster on duration alone
 DUR_TOL_S     = 120.0  # max duration difference (seconds) to call recordings the same mission
 WARN_TOL_FRAC = 0.6  # warn when a spread exceeds this fraction of the tolerance
 SHORT_WARN_S  = 30.0   # warn if any recording in a mission is shorter than this (seconds)
@@ -100,6 +101,15 @@ def discover(root):
     return recordings, orphans
 
 
+def start_tol_unlimited():
+    """START_TOL_S <= 0 means 'ignore start times entirely' (duration-only matching)."""
+    return START_TOL_S <= 0
+
+
+def fmt_start_tol():
+    return "unlimited (duration-only)" if start_tol_unlimited() else f"+/-{START_TOL_S:.0f}s"
+
+
 def cluster_missions(recordings):
     """
     Anchor-based clustering (NOT chaining):
@@ -107,6 +117,11 @@ def cluster_missions(recordings):
     admit later recordings whose start is within START_TOL of the anchor AND
     whose duration is within DUR_TOL of the anchor. Prevents drift.
     Recordings without a start time each become their own mission.
+
+    With --start-tol 0 the start-time test is disabled entirely (useful when one
+    camera's clock is wrong) and grouping rests on duration alone. In that mode a
+    recording with an unknown duration is never admitted to another anchor's
+    mission -- otherwise every such recording would match everything.
     """
     timed = sorted([r for r in recordings if r.start is not None], key=lambda r: r.start)
     untimed = [r for r in recordings if r.start is None]
@@ -121,14 +136,21 @@ def cluster_missions(recordings):
             if used[j]:
                 continue
             cand = timed[j]
-            if cand.start - anchor.start > START_TOL_S:
+            if not start_tol_unlimited() and cand.start - anchor.start > START_TOL_S:
                 break  # sorted: nothing further can be in range
             if cand.camera in {r.camera for r in group}:
                 continue  # one recording per camera per mission
-            dur_ok = (
-                anchor.duration is None or cand.duration is None
-                or abs(cand.duration - anchor.duration) <= DUR_TOL_S
-            )
+            if start_tol_unlimited():
+                # duration is the only signal left -- it has to be known on both sides
+                dur_ok = (
+                    anchor.duration is not None and cand.duration is not None
+                    and abs(cand.duration - anchor.duration) <= DUR_TOL_S
+                )
+            else:
+                dur_ok = (
+                    anchor.duration is None or cand.duration is None
+                    or abs(cand.duration - anchor.duration) <= DUR_TOL_S
+                )
             if dur_ok:
                 group.append(cand)
                 used[j] = True
@@ -190,7 +212,7 @@ def mission_warnings(group):
     if any(r.start_src in weak_src or r.dur_src in weak_src for r in group):
         flags.append("!W")
 
-    if len(timed) >= 2:
+    if len(timed) >= 2 and not start_tol_unlimited():
         spread = max(r.start for r in timed) - min(r.start for r in timed)
         if spread > START_TOL_S * WARN_TOL_FRAC:
             flags.append("!T")
@@ -311,7 +333,7 @@ def export_plan_csv(missions, cameras, filepath, names=None):
     with open(filepath, "w", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow([f"# organize_missions export  {now}"])
-        writer.writerow([f"# Tolerances: start +/-{START_TOL_S:.0f}s  |  duration +/-{DUR_TOL_S:.0f}s"])
+        writer.writerow([f"# Tolerances: start {fmt_start_tol()}  |  duration +/-{DUR_TOL_S:.0f}s"])
         writer.writerow([f"# Cameras: {', '.join(cameras)}  |  Missions: {len(missions)}"])
         writer.writerow([])
         writer.writerow(header)
@@ -464,7 +486,9 @@ def main():
     ap = argparse.ArgumentParser(description="Organize multi-camera GoPro footage into mission folders.")
     ap.add_argument("root", help="Folder containing camera subfolders (left/right/front/...)")
     ap.add_argument("--start-tol", type=float, default=START_TOL_S,
-                    help=f"Max start-time gap in seconds (default {START_TOL_S})")
+                    help=f"Max start-time gap in seconds (default {START_TOL_S}); "
+                         "0 = unlimited, ignore start times and match on duration alone "
+                         "(use when a camera's clock is wrong)")
     ap.add_argument("--dur-tol", type=float, default=DUR_TOL_S,
                     help=f"Max duration difference in seconds (default {DUR_TOL_S})")
     ap.add_argument("--timeline", action="store_true",
@@ -502,7 +526,7 @@ def main():
     plan = build_plan(root, missions, orphans, names=mission_names, leftovers=leftovers)
 
     print(f"Root: {root}")
-    print(f"Tolerances: start +/-{START_TOL_S:.0f}s, duration +/-{DUR_TOL_S:.0f}s")
+    print(f"Tolerances: start {fmt_start_tol()}, duration +/-{DUR_TOL_S:.0f}s")
     print(f"Cameras found: {cameras or '(none)'}")
     n_left = len(leftovers) if leftovers else 0
     print(f"Recordings: {len(recordings)} | Missions: {len(missions)} ({source}) | Unassigned: {n_left} | Orphans: {len(orphans)}")

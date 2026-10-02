@@ -14,6 +14,8 @@ extract_ros_imu.py      ← step 5: extract IMU data from a ROS2 bag into missio
 overlay_stats.py        ← step 6: generate ASS subtitle overlay from any ROS bag topic/field
 crop_missions.py        ← step 7: crop all cameras to a synced time window, archive originals
 run_pipeline.py         ← orchestrator: chains all steps over a root, pausing at 2 human checkpoints
+
+enhance_underwater.py   ← standalone (not a pipeline step): color-balance + fusion underwater enhancement
 ```
 
 ## What each script does
@@ -21,6 +23,8 @@ run_pipeline.py         ← orchestrator: chains all steps over a root, pausing 
 **`organize_missions.py`** — Scans a folder of GoPro camera subfolders, groups recordings across cameras into "missions" by matching start times and durations, produces a reviewable CSV, and moves files into named output folders after human approval.
 
 **`compact_missions.py`** — Scans a folder of already-organized mission subfolders (identified by `.gopro_mission` marker), concatenates chapter files per camera into single videos using lossless stream copy, and moves all originals to a `raw/` subfolder.
+
+**`enhance_underwater.py`** — Standalone tool (not part of the mission pipeline; not driven by `run_pipeline.py`). Python/OpenCV port of Ancuti et al. 2018, *"Color Balance and Fusion for Underwater Image Enhancement"* (the vendored MATLAB reference lives in `Color-Balance-and-fusion-for-underwater-image-enhancement.-./`). Runs red-channel color compensation → gray-world white balance → two derived inputs (sharpened + gamma) → three weight maps (Laplacian contrast `|Laplacian(L)|`, Achanta saliency, saturation) → normalized weights → multi-scale Laplacian/Gaussian pyramid fusion. Operates on a single image, a folder of images, or a video file (per-frame, re-encoded with the `mp4v` writer). Uses the paper-correct Laplacian-contrast weight (the MATLAB repo's `WC` is buggy — it equals `WSAT`). Requires `opencv-python`; imports only `VIDEO_EXTS` and `atomic_write_bytes` from `utils.py`. Image output is atomic (`cv2.imencode` → `atomic_write_bytes`); video output goes to a `{stem}.enhancing{ext}` temp then `os.replace` after a non-empty result.
 
 **`utils.py`** — Shared code imported across the toolchain. Constants/types: `MISSION_MARKER`, `NAME_RE`, `COMPACT_RE`, `SIMPLE_RE`, `VIDEO_EXTS`, `PROXY_EXTS`, `THUMB_EXTS`, `FileEntry`, `Recording`. Metadata helpers: `ffprobe()`, `thm_creation()`, `mtime()`, `best_start()`, `total_duration()`. Mission/IO helpers (added in the robustness pass): `find_missions(root, exit_on_empty=False)`, `is_mission()`, `mission_compacted()`, `load_metadata(mission, default=None)`, `save_metadata()` (atomic), `atomic_write_text()`, `atomic_write_bytes()`, `parse_time()`, `fmt_time()`. Any future tool should import from here rather than re-implementing — the discovery, metadata, and regex logic used to be copy-pasted (and subtly diverged) across five scripts.
 
@@ -151,7 +155,13 @@ Video numbers are matched as-is first, then zero-padded to 4 digits as fallback 
 
 **Custom mission prefix:** Set `MISSION_PREFIX = "mission_"` to get `mission_DiveArea` folders. Currently defaults to `""`.
 
-**Tighter/looser matching:** Adjust `START_TOL_S` and `DUR_TOL_S` at top of file or via `--start-tol` / `--dur-tol` CLI args.
+**Tighter/looser matching:** Adjust `START_TOL_S` and `DUR_TOL_S` at top of file or via `--start-tol` / `--dur-tol` CLI args. `run_pipeline.py` accepts the same two flags (they override `organize.start_tol_s` / `organize.dur_tol_s` in `pipeline.yaml`).
+
+**Bad camera clock — `--start-tol 0` (unlimited):** A start tolerance of `0` is treated as *unlimited*: `cluster_missions` skips the start-time test entirely and groups on duration alone (`start_tol_unlimited()` / `fmt_start_tol()`). Use it when one camera's RTC is wrong by minutes/hours, instead of inflating `--start-tol` until the real missions merge. Two consequences of this mode:
+- A recording with an **unknown duration** is never admitted to another anchor's mission (with no start test and no duration, it would match everything). It becomes its own single-recording mission.
+- The `!T` (near start tolerance) warning flag is not emitted — there is no tolerance to be near. The `Near Start Tol` CSV column is still exported, just always blank.
+
+Anchor order is still earliest-start-first, and the sorted-order `break` optimization in the admit loop is disabled in this mode (every later recording must be considered).
 
 **Same-video time-gap split:** If a camera reuses a 4-digit video# after a card reformat, two separate sessions collapse into one Recording. The `--timeline` output makes this visible (one recording with chapters hours apart). To fix: add a split in `discover` that starts a new Recording when consecutive chapters have an mtime gap larger than some threshold.
 
